@@ -1,0 +1,18 @@
+[Unit]
+Description=mcp-workbench MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/TO/mcp-workbench
+Environment=WORKBENCH_ENV_FILE=%h/.config/mcp-workbench/mcp-workbench.env
+ExecStart=/usr/bin/env bash ./scripts/start-server.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" fill="none">
+  <rect width="1280" height="720" fill="#0c0f14"/>
+  <rect x="0" y="0" width="1280" height="56" fill="#141823"/>
+  <text x="24" y="36" fill="#dce3ef" font-family="Inter, ui-sans-serif, system-ui" font-size="20" font-weight="700">ChatGPT Custom Connector</text>
+  <rect x="88" y="110" width="1104" height="496" rx="24" fill="#11161f" stroke="#283142"/>
+  <rect x="126" y="154" width="260" height="24" rx="8" fill="#2a3243"/>
+  <text x="142" y="171" fill="#e2e8f4" font-family="Inter, ui-sans-serif, system-ui" font-size="14" font-weight="600">Custom connector setup</text>
+  <rect x="126" y="208" width="510" height="56" rx="14" fill="#171c26" stroke="#2a3243"/>
+  <text x="150" y="242" fill="#9aa6bb" font-family="Inter, ui-sans-serif, system-ui" font-size="15">MCP server URL</text>
+  <text x="314" y="242" fill="#e2e8f4" font-family="SFMono-Regular, ui-monospace, monospace" font-size="15">https://your-tunnel/mcp</text>
+  <rect x="126" y="282" width="510" height="56" rx="14" fill="#171c26" stroke="#2a3243"/>
+  <text x="150" y="316" fill="#9aa6bb" font-family="Inter, ui-sans-serif, system-ui" font-size="15">Authentication</text>
+  <text x="314" y="316" fill="#e2e8f4" font-family="Inter, ui-sans-serif, system-ui" font-size="15">Bearer token</text>
+  <rect x="126" y="356" width="510" height="56" rx="14" fill="#171c26" stroke="#2a3243"/>
+  <text x="150" y="390" fill="#9aa6bb" font-family="Inter, ui-sans-serif, system-ui" font-size="15">Token</text>
+  <text x="314" y="390" fill="#e2e8f4" font-family="SFMono-Regular, ui-monospace, monospace" font-size="15">**************</text>
+  <rect x="684" y="208" width="382" height="204" rx="20" fill="#151a24" stroke="#2a3243"/>
+  <text x="714" y="246" fill="#9aa6bb" font-family="Inter, ui-sans-serif, system-ui" font-size="14">Connection hints</text>
+  <text x="714" y="280" fill="#e2e8f4" font-family="Inter, ui-sans-serif, system-ui" font-size="18" font-weight="700">Run automatically</text>
+  <text x="714" y="312" fill="#9aa6bb" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Good for read-heavy flows.</text>
+  <text x="714" y="340" fill="#9aa6bb" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Keep write-capable steps explicit.</text>
+  <rect x="714" y="372" width="290" height="12" rx="6" fill="#2a7de1"/>
+  <text x="126" y="486" fill="#7f8aa2" font-family="Inter, ui-sans-serif, system-ui" font-size="14">Use the same URL in ChatGPT, Notion, or any client that speaks MCP.</text>
+  <rect x="928" y="500" width="102" height="40" rx="12" fill="#2a7de1"/>
+  <text x="956" y="526" fill="#ffffff" font-family="Inter, ui-sans-serif, system-ui" font-size="14" font-weight="700">Connect</text>
+</svg>

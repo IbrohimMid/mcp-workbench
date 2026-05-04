@@ -1,0 +1,10 @@
+.env
+.env.local
+.codex
+.DS_Store
+logs/
+tmp/
+.mcp-workbench/
+.cloudflared/
+.cache/
+*.log

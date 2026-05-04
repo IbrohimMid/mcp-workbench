@@ -1,0 +1,19 @@
+[Unit]
+Description=mcp-workbench Cloudflare tunnel
+After=network-online.target mcp-workbench.service
+Wants=network-online.target
+Requires=mcp-workbench.service
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/TO/mcp-workbench
+Environment=WORKBENCH_ENV_FILE=%h/.config/mcp-workbench/mcp-workbench.env
+ExecStart=/usr/bin/env bash ./scripts/start-tunnel.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target
