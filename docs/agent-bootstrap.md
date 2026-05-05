@@ -18,6 +18,9 @@ Recommended agent behavior:
 6. Run `make verify`.
 7. Tell the user the final URLs and auth mode.
 
+After the workers are created, use `make dashboard` to inspect the worker list, connector URL, auth hint, and selected job signal.
+If you edit worker profiles, presets, or filters, run `make validate-config` before starting the worker.
+
 Helper commands:
 
 ```bash

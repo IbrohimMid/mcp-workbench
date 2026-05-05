@@ -16,15 +16,15 @@ const checks = [
   {
     file: 'README.md',
     forbidden: ['--unsafe-paths', 'Omni', 'omni'],
-    required: ['Agent-first setup', 'scripts/generate-worker.mjs', 'worker-install-systemd.sh', 'worker-profiles/dual-chatgpt-notion.yaml'],
+    required: ['Agent-first setup', 'scripts/generate-worker.mjs', 'worker-install-systemd.sh', 'worker-profiles/dual-chatgpt-notion.yaml', 'mcp-workbench dashboard', 'make validate-config'],
   },
   {
     file: 'AGENTS.md',
-    required: ['scripts/generate-worker.mjs', 'MCP_ALLOW_OUTSIDE_WORKSPACE=0', 'worker-profiles/dual-chatgpt-notion.yaml'],
+    required: ['scripts/generate-worker.mjs', 'MCP_ALLOW_OUTSIDE_WORKSPACE=0', 'worker-profiles/dual-chatgpt-notion.yaml', 'make validate-config'],
   },
   {
     file: 'docs/agent-bootstrap.md',
-    required: ['MCP_ALLOW_OUTSIDE_WORKSPACE=0', 'scripts/generate-worker.mjs', 'worker-up.sh', 'worker-profiles/dual-chatgpt-notion.yaml'],
+    required: ['MCP_ALLOW_OUTSIDE_WORKSPACE=0', 'scripts/generate-worker.mjs', 'worker-up.sh', 'worker-profiles/dual-chatgpt-notion.yaml', 'make validate-config'],
   },
   {
     file: 'worker-profiles/dual-chatgpt-notion.yaml',

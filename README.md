@@ -35,7 +35,9 @@ It ships with a bundled MCP server layer by default, plus an optional override i
 - [Why `mcp-workbench`](#why-mcp-workbench)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Dashboard](#dashboard)
 - [Agent-first setup](#agent-first-setup)
+- [Config validation](#config-validation)
 - [Smoke test](#smoke-test)
 - [Configuration](#configuration)
 
@@ -102,6 +104,8 @@ These example visuals show the main flows the repo is built around.
 - A minimal `bash` launcher for a local MCP server
 - A tunnel launcher for quick or named Cloudflare tunnels
 - Systemd user unit examples
+- A local dashboard for worker status, connector URLs, and job signals
+- A config validator for worker profiles, workflow presets, and signal filters
 - A single `.env` template with the knobs you usually need
 - Clear separation between the launcher, the tunnel, and the actual MCP backend
 
@@ -215,6 +219,44 @@ These example visuals show the main flows the repo is built around.
    systemctl --user enable --now mcp-workbench.service mcp-workbench-tunnel.service
    ```
 
+## Dashboard
+
+After you start the worker, open the local dashboard in your browser:
+
+```text
+http://127.0.0.1:3333/dashboard
+```
+
+If your `MCP_PORT` is different, replace `3333` with that port.
+
+You can also open it with:
+
+```bash
+make dashboard
+```
+
+The dashboard shows:
+
+- worker profiles and permission badges
+- connector URLs and auth hints
+- job timeline
+- selected job signal summary
+- quick tunnel or named tunnel notes
+
+This `mcp-workbench dashboard` is the quickest way to inspect worker state without reading env files by hand.
+
+The same dashboard also works for a selected worker profile when you pass `?worker=<name>` or `?job=<jobId>` in the URL.
+
+## Config validation
+
+Before you connect a client, run the validator against worker profiles, workflow presets, and signal filters:
+
+```bash
+make validate-config
+```
+
+Use this when you edit `worker-profiles/`, `workflow-presets/`, or `signal-filters/`. It catches malformed declarative config before you start a worker.
+
 ## Agent-first setup
 
 If you want multiple workers, let a local coding agent create them for you instead of editing a single `.env` by hand.
@@ -279,6 +321,12 @@ For a broader local check before commit or release, run:
 
 ```bash
 make verify
+```
+
+For config and profile validation only, run:
+
+```bash
+make validate-config
 ```
 
 ## Configuration
@@ -416,7 +464,7 @@ The installer copies the unit files into your user systemd directory and creates
 
 Quick tunnels are fine for development, but they are temporary.
 
-If you want a stable URL, use a named tunnel and `cloudflared/config.example.yml` as the starting point.
+If you want a stable URL, use a named tunnel and `cloudflared/config.example.yml` as the starting point. This is the better default once you publish a repo, demo to a team, or keep multiple workers online.
 
 Typical flow:
 

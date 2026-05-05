@@ -1,4 +1,4 @@
-.PHONY: up server tunnel install-systemd smoke-test doctor lint-security verify worker-generate worker-up worker-doctor worker-install-systemd worker-list
+.PHONY: up server tunnel install-systemd smoke-test doctor lint-security validate-config dashboard verify worker-generate worker-up worker-doctor worker-install-systemd worker-list
 
 up:
 	./scripts/up.sh
@@ -36,12 +36,21 @@ doctor:
 lint-security:
 	node ./scripts/security-check.mjs
 
+validate-config:
+	node ./scripts/validate-config.mjs
+
+dashboard:
+	@printf 'Open http://127.0.0.1:%s/dashboard\n' "$${MCP_PORT:-3333}"
+
 verify:
 	node --check server/workbench-server.mjs
+	node --check server/workbench-dashboard.mjs
 	node --check scripts/smoke-test.mjs
 	node --check scripts/doctor.mjs
 	node --check scripts/security-check.mjs
 	node --check scripts/generate-worker.mjs
+	node --check scripts/validate-config.mjs
 	bash -n scripts/*.sh
 	node ./scripts/security-check.mjs
+	node ./scripts/validate-config.mjs
 	node ./scripts/smoke-test.mjs

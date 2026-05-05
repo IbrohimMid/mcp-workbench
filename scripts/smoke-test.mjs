@@ -135,6 +135,12 @@ async function main() {
   assert(notionEnv.includes("MCP_ALLOW_OUTSIDE_WORKSPACE='0'"), 'notion env should keep workspace boundary');
   assert(chatgptEnv !== notionEnv, 'worker env files should differ');
 
+  const validateConfig = spawnSync(process.execPath, [
+    path.join(root, 'scripts', 'validate-config.mjs'),
+    '--root', root,
+  ], { encoding: 'utf8' });
+  assert(validateConfig.status === 0, `config validator failed: ${validateConfig.stderr || validateConfig.stdout}`);
+
   const workerDoctor = spawnSync('bash', ['-lc', 'WORKBENCH_ENV_FILE="$WORKBENCH_ENV_FILE" ./scripts/worker-doctor.sh chatgpt'], {
     cwd: root,
     env: {
@@ -538,6 +544,22 @@ async function main() {
     assert(debugHealthJson.workspace === workspaceDir, 'debug health workspace mismatch');
     assert(Array.isArray(debugHealthJson.enabledTools), 'debug health missing enabledTools');
 
+    const dashboard = await fetch(`${baseUrl}/dashboard`);
+    assert(dashboard.status === 200, `dashboard failed with ${dashboard.status}`);
+    const dashboardHtml = await dashboard.text();
+    assert(dashboardHtml.includes('mcp-workbench dashboard'), 'dashboard html missing title');
+
+    const dashboardState = await fetch(`${baseUrl}/api/dashboard`);
+    assert(dashboardState.status === 200, `dashboard state failed with ${dashboardState.status}`);
+    const dashboardStateJson = await dashboardState.json();
+    assert(dashboardStateJson.ok === true, 'dashboard state missing ok flag');
+    assert(dashboardStateJson.connection && dashboardStateJson.connection.mcpUrl, 'dashboard state missing mcpUrl');
+    assert(dashboardStateJson.current && dashboardStateJson.current.permissionLabel, 'dashboard state missing current worker summary');
+    const dashboardJobs = await fetch(`${baseUrl}/api/jobs`);
+    assert(dashboardJobs.status === 200, `dashboard jobs failed with ${dashboardJobs.status}`);
+    const dashboardJobsJson = await dashboardJobs.json();
+    assert(Array.isArray(dashboardJobsJson.jobs), 'dashboard jobs missing jobs array');
+
     const presetList = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'workflow_presets',
       arguments: {},
@@ -580,6 +602,12 @@ async function main() {
     const trace = workflowResultJson.result?.trace || [];
     assert(trace.length > 0, 'workflow trace is empty');
     assert(String(trace[0]?.result || '').includes('smoke-preset-ok'), 'workflow preset result mismatch');
+
+    const dashboardJobDetail = await fetch(`${baseUrl}/api/jobs/${jobId}`);
+    assert(dashboardJobDetail.status === 200, `dashboard job detail failed with ${dashboardJobDetail.status}`);
+    const dashboardJobDetailJson = await dashboardJobDetail.json();
+    assert(dashboardJobDetailJson.job && dashboardJobDetailJson.job.jobId === jobId, 'dashboard job detail job mismatch');
+    assert(dashboardJobDetailJson.signal && dashboardJobDetailJson.signal.rewind, 'dashboard job detail missing signal summary');
 
     const applyWorkflowStart = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'workflow',

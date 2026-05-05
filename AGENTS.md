@@ -11,8 +11,9 @@ When a user asks to create workers, follow this flow:
 5. Generate a distinct `MCP_TOKEN` for each worker.
 6. Treat `yolo` as write + shell + webfetch enabled, not as an escape from the workspace boundary.
 7. Run `make verify` after editing the repo.
-8. Run `./scripts/worker-doctor.sh <name>` for each generated worker.
-9. Print the final client URL, auth mode, and worker name back to the user.
+8. Run `make validate-config` after editing worker profiles, presets, or signal filters.
+9. Run `./scripts/worker-doctor.sh <name>` for each generated worker.
+10. Print the final client URL, auth mode, and worker name back to the user.
 
 If the user is asking for the common ChatGPT + Notion pair, prefer `worker-profiles/dual-chatgpt-notion.yaml` and `scripts/generate-worker.mjs --profile ...` instead of generating each worker by hand. Edit the workspace path first if the default example does not match the user's machine.
 

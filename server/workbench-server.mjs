@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { renderDashboardPage } from './workbench-dashboard.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,6 +44,7 @@ const jobMaxCount = Math.max(0, Number(process.env.MCP_JOB_MAX_COUNT || 200));
 const jobCleanupIntervalMs = Math.max(60_000, Number(process.env.MCP_JOB_CLEANUP_INTERVAL_MS || 3_600_000));
 
 const sessions = new Map();
+const sessionsByWorker = new Map();
 const jobs = new Map();
 
 if (!authToken && !allowNoAuth) {
@@ -139,6 +141,16 @@ function buildCorsHeaders(req) {
   return {};
 }
 
+function isLocalDashboardRequest(req) {
+  const hostHeader = String(req.headers.host || '').trim().toLowerCase();
+  return (
+    hostHeader.startsWith('localhost') ||
+    hostHeader.startsWith('127.0.0.1') ||
+    hostHeader.startsWith('[::1]') ||
+    hostHeader === '::1'
+  );
+}
+
 function applyCorsHeaders(req, res) {
   for (const [key, value] of Object.entries(buildCorsHeaders(req))) {
     res.setHeader(key, value);
@@ -154,6 +166,15 @@ function sendJson(res, status, body, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end(JSON.stringify(body));
+}
+
+function sendHtml(res, status, body, extraHeaders = {}) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...extraHeaders,
+  });
+  res.end(body);
 }
 
 function sendSseJson(res, status, body, extraHeaders = {}) {
@@ -1563,8 +1584,8 @@ function getJob(jobId) {
   return jobs.get(jobId) || null;
 }
 
-function loadJobFromDiskSync(jobId) {
-  const metaPath = path.join(realJobsRoot, jobId, 'meta.json');
+function loadJobFromDiskSync(jobId, baseDir = realJobsRoot) {
+  const metaPath = path.join(baseDir, jobId, 'meta.json');
   if (!fs.existsSync(metaPath)) return null;
   try {
     const raw = fs.readFileSync(metaPath, 'utf8');
@@ -2843,6 +2864,418 @@ function buildDebugHealthPayload() {
   };
 }
 
+function parseEnvFileText(text) {
+  const env = {};
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+    env[key] = value;
+  }
+  return env;
+}
+
+async function readEnvFile(filePath) {
+  try {
+    const raw = await fsp.readFile(filePath, 'utf8');
+    return parseEnvFileText(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function listWorkerEnvFiles() {
+  const discovered = new Map();
+  const directories = [
+    path.join(root, '.mcp-workbench', 'workers'),
+    path.join(os.homedir(), '.config', 'mcp-workbench', 'workers'),
+  ];
+
+  for (const directory of directories) {
+    const entries = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.env')) continue;
+      const filePath = path.join(directory, entry.name);
+      const env = await readEnvFile(filePath);
+      if (!env) continue;
+      const name = String(env.WORKBENCH_WORKER_NAME || env.MCP_SERVER_NAME || path.basename(entry.name, '.env')).trim();
+      if (!name) continue;
+      if (!discovered.has(name) || directory.includes(path.join(os.homedir(), '.config', 'mcp-workbench', 'workers'))) {
+        discovered.set(name, { filePath, env, name });
+      }
+    }
+  }
+
+  return [...discovered.values()].map((entry) => ({
+    ...entry,
+    summary: summarizeWorkerEnv(entry.env, entry.filePath),
+  }));
+}
+
+function envBoolValue(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
+function permissionLabelFromEnv(env) {
+  if (envBoolValue(env.MCP_ENABLE_WRITE_TOOLS) && envBoolValue(env.MCP_ENABLE_BASH)) return 'yolo';
+  if (envBoolValue(env.MCP_ENABLE_WRITE_TOOLS)) return 'standard';
+  return 'readonly';
+}
+
+function summarizeWorkerEnv(env, filePath = '') {
+  const host = String(env.MCP_HOST || '127.0.0.1').trim();
+  const port = Number(env.MCP_PORT || 0) || 3333;
+  const dashboardPort = Number(env.MCP_DASHBOARD_PORT || port) || port;
+  const serverNameValue = String(env.MCP_SERVER_NAME || 'mcp-workbench').trim();
+  const workerName = String(env.WORKBENCH_WORKER_NAME || serverNameValue.replace(/^mcp-workbench-/, '') || path.basename(filePath || '', '.env')).trim();
+  const client = String(env.WORKBENCH_WORKER_CLIENT || workerName || '').trim();
+  const workspace = String(env.WORKSPACE_DIR || '').trim();
+  const authRequired = !!String(env.MCP_TOKEN || '').trim() && !envBoolValue(env.MCP_ALLOW_NO_AUTH);
+  const allowQuery = envBoolValue(env.MCP_ALLOW_QUERY_TOKEN);
+  const tunnelMode = String(env.TUNNEL_MODE || 'quick').trim().toLowerCase();
+  const tunnelUrl = String(env.TUNNEL_URL || '').trim();
+  const mcpUrl = `http://${host}:${port}/mcp`;
+  const dashboardUrl = `http://${host}:${dashboardPort}/dashboard`;
+  const authMode = !authRequired
+    ? 'no-auth'
+    : allowQuery
+      ? 'bearer + query-token'
+      : 'bearer';
+  const authHeader = authRequired
+    ? `Authorization: Bearer ${String(env.MCP_TOKEN || '').trim()}`
+    : '';
+  const authHint = !authRequired
+    ? 'No auth required'
+    : allowQuery
+      ? `Authorization: Bearer ${String(env.MCP_TOKEN || '').trim()}`
+      : `Authorization: Bearer ${String(env.MCP_TOKEN || '').trim()}`;
+  return {
+    name: workerName,
+    client,
+    permissionLabel: permissionLabelFromEnv(env),
+    status: 'offline',
+    host,
+    port,
+    workspace,
+    tunnelMode,
+    tunnelUrl,
+    mcpUrl,
+    dashboardUrl,
+    authMode,
+    authHeader,
+    authHint,
+    tokenPresent: !!String(env.MCP_TOKEN || '').trim(),
+    jobDir: String(env.MCP_WORKFLOW_JOB_DIR || '').trim(),
+    workflowPresetDir: String(env.MCP_WORKFLOW_PRESET_DIR || '').trim(),
+    signalFilterDir: String(env.MCP_SIGNAL_FILTER_DIR || '').trim(),
+    filePath,
+    env,
+  };
+}
+
+async function checkWorkerStatus(summary) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('health timeout')), 900);
+  try {
+    const res = await fetch(`http://${summary.host}:${summary.port}/health`, { signal: controller.signal });
+    return res.ok ? 'running' : 'offline';
+  } catch {
+    return 'offline';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function discoverWorkers() {
+  const workers = await listWorkerEnvFiles();
+  for (const worker of workers) {
+    worker.status = await checkWorkerStatus(worker);
+  }
+  return workers;
+}
+
+function pickWorker(workers, workerName) {
+  if (workerName) {
+    const found = workers.find((worker) => worker.name === workerName);
+    if (found) return found;
+  }
+  const currentName = String(process.env.WORKBENCH_WORKER_NAME || serverName.replace(/^mcp-workbench-/, '') || '').trim();
+  if (currentName) {
+    const found = workers.find((worker) => worker.name === currentName);
+    if (found) return found;
+  }
+  return workers[0] || summarizeWorkerEnv({
+    MCP_SERVER_NAME: serverName,
+    MCP_HOST: host,
+    MCP_PORT: String(port),
+    WORKSPACE_DIR: root,
+    MCP_TOKEN: authToken,
+    MCP_ALLOW_NO_AUTH: allowNoAuth ? '1' : '0',
+    MCP_ALLOW_QUERY_TOKEN: allowQueryToken ? '1' : '0',
+    MCP_ALLOW_OUTSIDE_WORKSPACE: allowOutside ? '1' : '0',
+    MCP_WORKFLOW_JOB_DIR: jobsRoot,
+    MCP_WORKFLOW_PRESET_DIR: workflowPresetsRoot,
+    MCP_SIGNAL_FILTER_DIR: workspaceSignalFiltersRoot,
+    MCP_WORKFLOW_MODE: 'sync',
+    TUNNEL_MODE: 'quick',
+    TUNNEL_URL: `http://${host}:${port}`,
+    WORKBENCH_WORKER_NAME: currentName || serverName.replace(/^mcp-workbench-/, '') || 'mcp-workbench',
+    WORKBENCH_WORKER_CLIENT: 'local',
+    WORKBENCH_WORKER_PERMISSION: permissionLabelFromEnv({
+      MCP_ENABLE_WRITE_TOOLS: enableWriteTools ? '1' : '0',
+      MCP_ENABLE_BASH: enableBash ? '1' : '0',
+      MCP_ENABLE_WEBFETCH: enableWebfetch ? '1' : '0',
+    }),
+  }, '');
+}
+
+async function listJobsForWorker(worker, limit = 50) {
+  const jobDir = path.resolve(worker.jobDir || jobsRoot);
+  const entries = await fsp.readdir(jobDir, { withFileTypes: true }).catch(() => []);
+  const jobsList = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const job = loadJobFromDiskSync(entry.name, jobDir);
+    if (!job) continue;
+    jobsList.push(job);
+  }
+
+  const selected = jobsList
+    .sort((a, b) => {
+      const aTime = Date.parse(a.finishedAt || a.startedAt || a.createdAt || '') || 0;
+      const bTime = Date.parse(b.finishedAt || b.startedAt || b.createdAt || '') || 0;
+      return bTime - aTime;
+    })
+    .slice(0, limit)
+    .map((job) => ({
+      jobId: job.jobId,
+      kind: job.kind,
+      title: job.title,
+      status: job.status,
+      createdAt: job.createdAt,
+      createdAtLabel: formatRelativeDate(job.createdAt),
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+      message: job.message,
+      exitCode: job.exitCode,
+      signal: job.signal,
+      currentStep: job.currentStep || 0,
+      totalSteps: job.totalSteps || 0,
+      childJobId: job.childJobId || null,
+      presetName: job.presetName || null,
+      presetPath: job.presetPath || null,
+      command: job.command || null,
+    }));
+
+  return selected;
+}
+
+function formatRelativeDate(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const diffMs = Date.now() - date.getTime();
+  const diffMinutes = Math.round(diffMs / 60000);
+  if (diffMinutes < 1) return 'now';
+  if (diffMinutes < 60) return `${diffMinutes}m`;
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours}h`;
+  const diffDays = Math.round(diffHours / 24);
+  return `${diffDays}d`;
+}
+
+async function callWorkerTool(worker, method, params = {}) {
+  const baseUrl = `http://${worker.host}:${worker.port}/mcp`;
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+  };
+  if (worker.tokenPresent) {
+    headers.authorization = `Bearer ${String(worker.env.MCP_TOKEN || '').trim()}`;
+  }
+
+  let sessionId = sessionsByWorker.get(worker.name) || null;
+  if (!sessionId) {
+    const initResponse = await fetch(baseUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: `dashboard-init-${crypto.randomUUID()}`,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          clientInfo: { name: 'mcp-workbench-dashboard', version: serverVersion },
+          capabilities: {},
+        },
+      }),
+    });
+    const initBody = await readRpcBody(initResponse);
+    sessionId = initResponse.headers.get('mcp-session-id') || initBody?.result?.sessionId || null;
+    if (sessionId) sessionsByWorker.set(worker.name, sessionId);
+  }
+
+  const response = await fetch(baseUrl, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: `dashboard-call-${crypto.randomUUID()}`,
+      method,
+      params,
+    }),
+  });
+
+  return readRpcBody(response);
+}
+
+async function readRpcBody(response) {
+  const text = await response.text();
+  if (!text.trim()) return null;
+  if (text.includes('data:')) {
+    const line = text.split(/\r?\n/).find((entry) => entry.startsWith('data:')) || '';
+    const json = line.slice(5).trimStart();
+    return json ? JSON.parse(json) : null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function getLocalJobSignal(job) {
+  if (!job) return null;
+  try {
+    return await buildJobSignal(job, { includeRaw: false });
+  } catch (error) {
+    return {
+      error: String(error?.message || error),
+    };
+  }
+}
+
+async function buildDashboardPayload(urlObj) {
+  const workerName = String(urlObj.searchParams.get('worker') || '').trim();
+  const jobId = String(urlObj.searchParams.get('job') || '').trim();
+  const workers = await discoverWorkers();
+  const current = pickWorker(workers, workerName);
+  const jobs = await listJobsForWorker(current, 60);
+  const selectedJob = jobId || jobs.find((job) => job.status === 'running')?.jobId || jobs[0]?.jobId || null;
+  const selectedJobRecord = selectedJob ? loadJobFromDiskSync(selectedJob, path.resolve(current.jobDir || jobsRoot)) : null;
+  const selectedSignal = selectedJobRecord ? await getLocalJobSignal(selectedJobRecord) : null;
+  const mcpUrl = current.mcpUrl;
+  const dashboardUrl = current.dashboardUrl;
+  const tunnelUrl = current.tunnelUrl ? `${current.tunnelUrl.replace(/\/$/, '')}/mcp` : '';
+  return {
+    ok: true,
+    server: {
+      name: serverName,
+      version: serverVersion,
+    },
+    current: {
+      ...current,
+      mcpUrl,
+      dashboardUrl,
+      tunnelUrl,
+      status: current.status || 'offline',
+      permissionLabel: current.permissionLabel,
+      authMode: current.authMode,
+      authHeader: current.authHeader,
+      authHint: current.authHint,
+    },
+    connection: {
+      mcpUrl,
+      dashboardUrl,
+      tunnelUrl,
+      authMode: current.authMode,
+      authHeader: current.authHeader,
+      authHint: current.authHint,
+      queryTokenHint: allowQueryToken ? 'query token enabled' : 'query token disabled',
+      noAuthHint: allowNoAuth ? 'no auth enabled for local development' : 'auth required',
+    },
+    tunnel: {
+      mode: current.tunnelMode || 'quick',
+      modeLabel: current.tunnelMode === 'named' ? 'named tunnel' : 'quick tunnel',
+      hint: current.tunnelMode === 'named'
+        ? 'Named tunnel keeps the public URL stable.'
+        : 'Quick tunnel is fine for development and testing.',
+      configPath: String(process.env.CLOUDFLARED_CONFIG || '').trim(),
+    },
+    workers: workers.map((worker) => ({
+      name: worker.name,
+      client: worker.client,
+      permissionLabel: worker.permissionLabel,
+      status: worker.status,
+      workspace: worker.workspace,
+      port: worker.port,
+      host: worker.host,
+      dashboardUrl: worker.dashboardUrl,
+      mcpUrl: worker.mcpUrl,
+      tunnelMode: worker.tunnelMode,
+      isSelected: worker.name === current.name,
+    })),
+    jobs: jobs.map((job) => ({
+      ...job,
+      isSelected: job.jobId === selectedJob,
+    })),
+    selectedSignal,
+    selectedJobId: selectedJob,
+    stats: {
+      workerCount: workers.length,
+      jobCount: jobs.length,
+      runningJobs: jobs.filter((job) => job.status === 'running').length,
+      failedJobs: jobs.filter((job) => job.status === 'failed').length,
+    },
+  };
+}
+
+async function getDashboardJobDetail(urlObj, jobId) {
+  const workerName = String(urlObj.searchParams.get('worker') || '').trim();
+  const workers = await discoverWorkers();
+  const current = pickWorker(workers, workerName);
+  const job = loadJobFromDiskSync(jobId, path.resolve(current.jobDir || jobsRoot));
+  const signal = job ? await getLocalJobSignal(job) : null;
+  return {
+    ok: true,
+    worker: {
+      name: current.name,
+      client: current.client,
+      dashboardUrl: current.dashboardUrl,
+      mcpUrl: current.mcpUrl,
+      permissionLabel: current.permissionLabel,
+    },
+    job: job ? {
+      jobId: job.jobId,
+      kind: job.kind,
+      title: job.title,
+      status: job.status,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+      message: job.message,
+      error: job.error,
+      result: job.result,
+      exitCode: job.exitCode,
+      signal: job.signal,
+      pid: job.pid,
+      childJobId: job.childJobId,
+      command: job.command,
+      cwd: job.cwd,
+      presetName: job.presetName,
+      presetPath: job.presetPath,
+      permissions: job.permissions,
+    } : null,
+    signal,
+  };
+}
+
 function getSession(req, method) {
   const header = String(req.headers['mcp-session-id'] || '').trim();
   if (header && sessions.has(header)) return sessions.get(header);
@@ -2953,6 +3386,105 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
+    return;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname === '/dashboard') {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendHtml(res, 401, '<!doctype html><title>mcp-workbench dashboard</title><p>unauthorized</p>');
+      return;
+    }
+    buildDashboardPayload(urlObj)
+      .then((state) => {
+        sendHtml(res, 200, renderDashboardPage(state));
+      })
+      .catch((error) => {
+        sendHtml(res, 500, `<!doctype html><title>mcp-workbench dashboard</title><pre>${String(error?.stack || error)}</pre>`);
+      });
+    return;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname === '/api/dashboard') {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    buildDashboardPayload(urlObj)
+      .then((state) => {
+        sendJson(res, 200, state);
+      })
+      .catch((error) => {
+        sendJson(res, 500, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname === '/api/workers') {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    discoverWorkers()
+      .then((workers) => {
+        sendJson(res, 200, {
+          ok: true,
+          workers: workers.map((worker) => ({
+            name: worker.name,
+            client: worker.client,
+            permissionLabel: worker.permissionLabel,
+            status: worker.status,
+            workspace: worker.workspace,
+            port: worker.port,
+            host: worker.host,
+            dashboardUrl: worker.dashboardUrl,
+            mcpUrl: worker.mcpUrl,
+            tunnelMode: worker.tunnelMode,
+          })),
+        });
+      })
+      .catch((error) => {
+        sendJson(res, 500, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname === '/api/jobs') {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    buildDashboardPayload(urlObj)
+      .then((state) => {
+        sendJson(res, 200, { ok: true, jobs: state.jobs, worker: state.current });
+      })
+      .catch((error) => {
+        sendJson(res, 500, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname.startsWith('/api/jobs/')) {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    const parts = urlObj.pathname.split('/').filter(Boolean);
+    const jobId = decodeURIComponent(parts[2] || '');
+    if (!jobId) {
+      sendJson(res, 400, { error: 'job id is required' });
+      return;
+    }
+    getDashboardJobDetail(urlObj, jobId)
+      .then((payload) => {
+        if (!payload.job) {
+          sendJson(res, 404, { error: 'job not found' });
+          return;
+        }
+        sendJson(res, 200, payload);
+      })
+      .catch((error) => {
+        sendJson(res, 500, { error: String(error?.message || error) });
+      });
     return;
   }
 
