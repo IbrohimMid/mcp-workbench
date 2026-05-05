@@ -1,10 +1,43 @@
 # mcp-workbench
 
+<p align="center">
+  <img src="docs/screenshots/readme-hero.png" alt="mcp-workbench hero" width="320" />
+</p>
+
+<p align="center"><strong>Self-hosted MCP worker factory for ChatGPT, Notion, and local agent workflows.</strong></p>
+
+<p align="center">
+  <code>self-hosted</code>
+  <code>workspace-bound</code>
+  <code>async jobs</code>
+  <code>signal layer</code>
+  <code>multi-worker</code>
+</p>
+
+<blockquote>
+A local MCP execution layer for power users who want repeatable workers, clear workspace boundaries, and condensed job output without rebuilding the stack each time.
+</blockquote>
+
 Public template for a self-hosted MCP worker behind Cloudflare Tunnel.
 
 This repo is meant to be cloned, configured with your own workspace, and then pointed at your own `cloudflared` instance.
 
 It ships with a bundled MCP server layer by default, plus an optional override if you want to run an external backend instead.
+
+## Table of contents
+
+- [Security warning](#security-warning)
+- [How it works](#how-it-works)
+- [Architecture](#architecture)
+- [Screenshots](#screenshots)
+- [What you get](#what-you-get)
+- [Use cases](#use-cases)
+- [Why `mcp-workbench`](#why-mcp-workbench)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Agent-first setup](#agent-first-setup)
+- [Smoke test](#smoke-test)
+- [Configuration](#configuration)
 
 ## Security warning
 
