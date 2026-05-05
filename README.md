@@ -182,6 +182,52 @@ These example visuals show the main flows the repo is built around.
    systemctl --user enable --now mcp-workbench.service mcp-workbench-tunnel.service
    ```
 
+## Agent-first setup
+
+If you want multiple workers, let a local coding agent create them for you instead of editing a single `.env` by hand.
+
+Example prompt:
+
+```text
+buatin 2 worker, 1 untuk chatgpt, satu untuk notion. permission nya keduanya YOLO dan workdir di Documents/project
+```
+
+The agent should follow [AGENTS.md](AGENTS.md) and generate one env file per worker under `.mcp-workbench/workers/`.
+The built-in permission presets are `readonly`, `standard`, and `yolo`; `yolo` still keeps the workspace boundary enforced.
+You can also start from `worker-profiles/dual-chatgpt-notion.yaml` and edit the workspace path if needed before generating both workers in one shot.
+
+Suggested commands:
+
+```bash
+node ./scripts/generate-worker.mjs --profile worker-profiles/dual-chatgpt-notion.yaml
+node ./scripts/generate-worker.mjs --name chatgpt --client chatgpt --workspace ~/Documents/project --permission yolo --port 3333
+node ./scripts/generate-worker.mjs --name notion --client notion --workspace ~/Documents/project --permission yolo --port 3334
+./scripts/worker-list.sh
+./scripts/worker-doctor.sh chatgpt
+./scripts/worker-doctor.sh notion
+./scripts/worker-up.sh chatgpt
+./scripts/worker-up.sh notion
+```
+
+If you prefer `make`:
+
+```bash
+make worker-generate ARGS='--name chatgpt --client chatgpt --workspace ~/Documents/project --permission yolo --port 3333'
+make worker-up WORKER=chatgpt
+make worker-doctor WORKER=chatgpt
+make worker-install-systemd WORKER=chatgpt
+```
+
+For a persistent setup, install per-worker systemd units:
+
+```bash
+./scripts/worker-install-systemd.sh chatgpt
+./scripts/worker-install-systemd.sh notion
+systemctl --user daemon-reload
+systemctl --user enable --now mcp-workbench-chatgpt.service mcp-workbench-chatgpt-tunnel.service
+systemctl --user enable --now mcp-workbench-notion.service mcp-workbench-notion-tunnel.service
+```
+
 ## Smoke test
 
 Run the bundled end-to-end check before you point a client at the worker:
@@ -194,6 +240,12 @@ If you do not use `make`, run:
 
 ```bash
 node ./scripts/smoke-test.mjs
+```
+
+For a broader local check before commit or release, run:
+
+```bash
+make verify
 ```
 
 ## Configuration
@@ -210,6 +262,7 @@ node ./scripts/smoke-test.mjs
 | `MCP_PORT` | Local server port | `3333` |
 | `MCP_ENABLE_WRITE_TOOLS` | Expose `write`, `edit`, `apply_patch` | `0` |
 | `MCP_ENABLE_BASH` | Expose `bash` and bash job tools | `0` |
+| `MCP_SANITIZE_BASH_ENV` | Strip risky environment variables from `bash` jobs | `1` |
 | `MCP_ENABLE_WEBFETCH` | Expose `webfetch` | `0` |
 | `MCP_ENABLE_WORKFLOW` | Expose `workflow` and workflow cancel | `1` |
 | `MCP_RESPONSE_MODE` | `auto`, `json`, or `sse` response mode | `auto` |
@@ -218,6 +271,8 @@ node ./scripts/smoke-test.mjs
 | `MCP_WORKFLOW_MODE` | Workflow mode hint for your runtime | `sync` |
 | `MCP_WORKFLOW_JOB_DIR` | Job storage directory | `.mcp-workbench/jobs` |
 | `MCP_WORKFLOW_PRESET_DIR` | Declarative workflow presets directory | `workflow-presets` |
+| `MCP_SIGNAL_FILTER_DIR` | Workspace-local signal filters directory | `.mcp-workbench/signal-filters` |
+| `MCP_SIGNAL_TRUST_REGISTRY` | Trusted workspace filter registry path | `~/.config/mcp-workbench/trusted-workspaces.json` |
 | `MCP_WORKFLOW_POLL_INTERVAL_MS` | Poll interval for async jobs | `1000` |
 | `MCP_JOB_RETENTION_HOURS` | Cleanup age for finished jobs | `24` |
 | `MCP_JOB_MAX_COUNT` | Maximum retained finished jobs | `200` |
@@ -247,6 +302,10 @@ The bundled server layer exposes the common tools directly. High-risk tools are 
 - `bash_result`
 - `bash_kill`
 - `webfetch`
+- `job_retrieve`
+- `signal_diff`
+- `signal_filters`
+- `trust_workspace_filters`
 - `workflow`
 - `workflow_presets`
 - `signal`
@@ -260,12 +319,13 @@ It is the default when `MCP_SERVER_CMD` is empty.
 
 | Group | Tools | Risk |
 | --- | --- | --- |
-| Read-only | `read`, `glob`, `grep`, `codesearch`, `lsp` | lower |
+| Read-only | `read`, `glob`, `grep`, `codesearch`, `lsp`, `job_retrieve`, `signal_diff`, `signal_filters` | lower |
 | Network | `webfetch` | medium |
 | Write | `write`, `edit`, `apply_patch` | high |
 | Execution | `bash`, `bash_status`, `bash_tail`, `bash_result`, `bash_kill` | very high |
 | Workflow | `workflow`, `workflow_status`, `workflow_result`, `workflow_cancel` | depends on steps |
 | Presets | `workflow_presets` | lower |
+| Settings | `trust_workspace_filters` | low |
 | Signal | `signal` | lower |
 
 ## Tool semantics
@@ -275,16 +335,27 @@ It is the default when `MCP_SERVER_CMD` is empty.
 - `workflow` is a job wrapper that can run inline steps or a named preset.
 - `bash` returns a `job_id` immediately and should be followed by `bash_status`, `bash_tail`, or `bash_result`.
 - `workflow_presets` lists preset files from `MCP_WORKFLOW_PRESET_DIR` and can inspect a named preset.
-- `signal` is the built-in signal layer in this repo: it distills noisy job output into a compact summary while keeping raw logs on disk.
+- `signal` is the built-in signal layer in this repo: it distills noisy job output into a compact summary, adds rewind refs, and keeps raw logs on disk.
+- `job_retrieve` reads raw job output again from a `rewind:...` ref when you need the uncompressed log.
+- `signal_diff` shows the raw preview next to the distilled signal view.
+- `signal_filters` inspects the built-in and workspace-local signal filters.
+- `trust_workspace_filters` marks local workspace filters as trusted for the current workspace.
+- Workspace-local signal filters live in `MCP_SIGNAL_FILTER_DIR` and are trusted per workspace through `MCP_SIGNAL_TRUST_REGISTRY`.
 
 ## Signal layer
 
 The bundled `signal` tool is the built-in complement to `bash` and `workflow`.
 
 - Use `signal` when you want a condensed view of a job result.
+- Use `signal_diff` when you want to compare the raw preview with the distilled summary.
 - Use `bash_tail` when you want the raw tail of stdout and stderr.
 - Use `bash_result` or `workflow_result` when you want the final structured job payload.
+- Use `job_retrieve` when you want the raw log again from a rewind ref.
 - The raw job logs still remain on disk under `.mcp-workbench/jobs/`.
+- Built-in filters live in `signal-filters/`.
+- Workspace-local filters live under `MCP_SIGNAL_FILTER_DIR` and are inactive until trusted.
+
+`bash` jobs are sanitized by default when `MCP_SANITIZE_BASH_ENV=1`, which strips a denylist of env variables before spawning the shell.
 
 ## Optional external backend command
 

@@ -16,6 +16,19 @@ const checks = [
   {
     file: 'README.md',
     forbidden: ['--unsafe-paths', 'Omni', 'omni'],
+    required: ['Agent-first setup', 'scripts/generate-worker.mjs', 'worker-install-systemd.sh', 'worker-profiles/dual-chatgpt-notion.yaml'],
+  },
+  {
+    file: 'AGENTS.md',
+    required: ['scripts/generate-worker.mjs', 'MCP_ALLOW_OUTSIDE_WORKSPACE=0', 'worker-profiles/dual-chatgpt-notion.yaml'],
+  },
+  {
+    file: 'docs/agent-bootstrap.md',
+    required: ['MCP_ALLOW_OUTSIDE_WORKSPACE=0', 'scripts/generate-worker.mjs', 'worker-up.sh', 'worker-profiles/dual-chatgpt-notion.yaml'],
+  },
+  {
+    file: 'worker-profiles/dual-chatgpt-notion.yaml',
+    required: ['chatgpt', 'notion', 'permission: yolo'],
   },
   {
     file: '.env.example',
@@ -24,6 +37,7 @@ const checks = [
       'MCP_ALLOW_QUERY_TOKEN=0',
       'MCP_ENABLE_WRITE_TOOLS=0',
       'MCP_ENABLE_BASH=0',
+      'MCP_SANITIZE_BASH_ENV=1',
       'MCP_ENABLE_WEBFETCH=0',
       'MCP_ENABLE_WORKFLOW=1',
       'MCP_RESPONSE_MODE=auto',

@@ -26,6 +26,27 @@ load_env() {
   fi
 }
 
+worker_env_file() {
+  local name="$1"
+  local root config_dir repo_file config_file
+  root="$(workbench_root)"
+  config_dir="${HOME}/.config/mcp-workbench/workers"
+  repo_file="${root}/.mcp-workbench/workers/${name}.env"
+  config_file="${config_dir}/${name}.env"
+
+  if [[ -f "${WORKBENCH_ENV_FILE:-}" ]]; then
+    printf '%s\n' "${WORKBENCH_ENV_FILE}"
+    return 0
+  fi
+
+  if [[ -f "${config_file}" ]]; then
+    printf '%s\n' "${config_file}"
+    return 0
+  fi
+
+  printf '%s\n' "${repo_file}"
+}
+
 require_var() {
   local name="$1"
   local value="${!name:-}"
@@ -52,4 +73,3 @@ wait_for_port() {
     sleep 1
   done
 }
-

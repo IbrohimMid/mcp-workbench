@@ -7,6 +7,9 @@
 
 The bundled server layer in this repo exposes the common coding tools directly, and `workflow` can batch several actions into one call.
 The `signal` tool gives you a distilled version of noisy job output without replacing the raw logs.
+`signal_diff` compares raw preview output with the distilled signal, and `job_retrieve` reads raw logs again from a rewind ref.
+Workspace-local signal filters live under `.mcp-workbench/signal-filters/` and stay inactive until you trust them.
+Use `signal_filters` to inspect active filters and `trust_workspace_filters` to trust the local ones.
 
 If you use a quick tunnel, update the allowlist when the URL changes.
 

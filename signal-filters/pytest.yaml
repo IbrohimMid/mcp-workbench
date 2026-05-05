@@ -1,0 +1,19 @@
+name: pytest
+description: Python pytest signal distiller.
+match:
+  command:
+    - "(^|\\s)pytest(\\s|$)"
+rules:
+  keep:
+    - "FAILED "
+    - "ERROR "
+    - "short test summary info"
+  warn:
+    - "^warnings summary"
+  drop:
+    - "^collected "
+    - "^platform "
+    - "^rootdir "
+  highlight:
+    - "passed"
+    - "failed"

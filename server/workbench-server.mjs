@@ -2,6 +2,7 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -10,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const repoRoot = path.resolve(__dirname, '..');
 const root = path.resolve(process.env.WORKSPACE_DIR || path.join(__dirname, '..'));
 const host = process.env.MCP_HOST || '127.0.0.1';
 const port = Number(process.env.MCP_PORT || 3333);
@@ -23,6 +25,7 @@ const enableWriteTools = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_WRITE_
 const enableBash = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_BASH || '');
 const enableWebfetch = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_WEBFETCH || '');
 const enableWorkflow = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_WORKFLOW || '1');
+const sanitizeBashEnv = /^(1|true|yes|on)$/i.test(process.env.MCP_SANITIZE_BASH_ENV || '1');
 const maxBodyBytes = Math.max(1024, Number(process.env.MCP_MAX_BODY_BYTES || 1048576));
 const responseMode = String(process.env.MCP_RESPONSE_MODE || 'auto').trim().toLowerCase();
 const allowedOrigins = String(process.env.MCP_ALLOWED_ORIGINS || '*')
@@ -31,6 +34,9 @@ const allowedOrigins = String(process.env.MCP_ALLOWED_ORIGINS || '*')
   .filter(Boolean);
 const jobsRoot = path.resolve(process.env.MCP_WORKFLOW_JOB_DIR || path.join(root, '.mcp-workbench', 'jobs'));
 const workflowPresetsRoot = path.resolve(process.env.MCP_WORKFLOW_PRESET_DIR || path.join(root, 'workflow-presets'));
+const workspaceSignalFiltersRoot = path.resolve(process.env.MCP_SIGNAL_FILTER_DIR || path.join(root, '.mcp-workbench', 'signal-filters'));
+const builtinSignalFiltersRoot = path.join(repoRoot, 'signal-filters');
+const trustedSignalRegistryPath = path.resolve(process.env.MCP_SIGNAL_TRUST_REGISTRY || path.join(os.homedir(), '.config', 'mcp-workbench', 'trusted-workspaces.json'));
 const pollIntervalMs = Math.max(250, Number(process.env.MCP_WORKFLOW_POLL_INTERVAL_MS || 1000));
 const jobRetentionHours = Math.max(0, Number(process.env.MCP_JOB_RETENTION_HOURS || 24));
 const jobMaxCount = Math.max(0, Number(process.env.MCP_JOB_MAX_COUNT || 200));
@@ -45,7 +51,7 @@ if (!authToken && !allowNoAuth) {
 }
 
 if (!allowOutside) {
-  for (const candidate of [jobsRoot, workflowPresetsRoot]) {
+  for (const candidate of [jobsRoot, workflowPresetsRoot, workspaceSignalFiltersRoot]) {
     const rel = path.relative(root, candidate);
     if (rel.startsWith('..') || path.isAbsolute(rel)) {
       throw new Error(`configured path escapes workspace: ${candidate}`);
@@ -304,6 +310,342 @@ function normalizeSignalText(text) {
   return stripAnsi(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+function redactSecrets(text) {
+  return String(text || '')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+\b/gi, 'Bearer [REDACTED]')
+    .replace(/\b(token|password|secret|api_key|apikey)=([^\s"'`]+)/gi, '$1=[REDACTED]')
+    .replace(/\b(token|password|secret|api_key|apikey):\s*([^\s"'`]+)/gi, '$1: [REDACTED]');
+}
+
+function safeSignalPath(filePath) {
+  const rel = path.relative(root, filePath);
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+    return rel;
+  }
+  return path.basename(filePath);
+}
+
+const bashEnvDenylist = new Set([
+  'BASH_ENV',
+  'CDPATH',
+  'ENV',
+  'GIT_ASKPASS',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'NODE_OPTIONS',
+  'NPM_CONFIG_USERCONFIG',
+  'PYTHONSTARTUP',
+  'PYTHONHOME',
+  'PYTHONPATH',
+  'PROMPT_COMMAND',
+  'RUBYOPT',
+  'RUSTC_WRAPPER',
+  'SSH_ASKPASS',
+  'TERMINFO',
+  'TERMINFO_DIRS',
+  'VISUAL',
+  'EDITOR',
+]);
+
+function estimateTokens(text) {
+  return Math.max(0, Math.ceil(String(text || '').length / 4));
+}
+
+function sanitizeBashEnvironment(source = process.env) {
+  if (!sanitizeBashEnv) {
+    return { ...source };
+  }
+
+  const env = {};
+  for (const [key, value] of Object.entries(source || {})) {
+    if (bashEnvDenylist.has(key)) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(String(text || ''), 'utf8').digest('hex');
+}
+
+function normalizeList(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry).trim()).filter(Boolean);
+  }
+  if (value == null || value === '') return [];
+  return [String(value).trim()].filter(Boolean);
+}
+
+async function readTextIfExists(filePath) {
+  try {
+    return await fsp.readFile(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+async function readJsonIfExists(filePath) {
+  const raw = await readTextIfExists(filePath);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return isPlainObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function readPatternList(value) {
+  return normalizeList(value);
+}
+
+function textMatchesPattern(text, pattern) {
+  const candidate = String(text || '');
+  const raw = String(pattern || '').trim();
+  if (!raw) return false;
+  try {
+    return new RegExp(raw, 'i').test(candidate);
+  } catch {
+    return candidate.toLowerCase().includes(raw.toLowerCase());
+  }
+}
+
+function textMatchesAnyPattern(text, patterns = []) {
+  return normalizeList(patterns).some((pattern) => textMatchesPattern(text, pattern));
+}
+
+function uniqueBy(items, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = keyFn(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function buildSignalSummaryText(signal) {
+  const parts = [];
+  if (signal?.headline) parts.push(`headline: ${signal.headline}`);
+  if (signal?.nextAction) parts.push(`nextAction: ${signal.nextAction}`);
+  if (Array.isArray(signal?.keyLines) && signal.keyLines.length) {
+    parts.push(`keyLines:\n${signal.keyLines.join('\n')}`);
+  }
+  if (Array.isArray(signal?.errors) && signal.errors.length) {
+    parts.push(`errors:\n${signal.errors.join('\n')}`);
+  }
+  if (Array.isArray(signal?.warnings) && signal.warnings.length) {
+    parts.push(`warnings:\n${signal.warnings.join('\n')}`);
+  }
+  return parts.join('\n\n');
+}
+
+async function readFileWindow(filePath, maxBytes = 50000, mode = 'tail') {
+  const buffer = await fsp.readFile(filePath);
+  const bytes = buffer.byteLength;
+  const truncated = bytes > maxBytes;
+  const slice = truncated
+    ? mode === 'head'
+      ? buffer.subarray(0, maxBytes)
+      : buffer.subarray(Math.max(0, bytes - maxBytes))
+    : buffer;
+  return {
+    text: slice.toString('utf8'),
+    bytes,
+    truncated,
+  };
+}
+
+async function readTrustedWorkspaceRegistry() {
+  return readJsonIfExists(trustedSignalRegistryPath);
+}
+
+async function writeTrustedWorkspaceRegistry(registry) {
+  await ensureDir(path.dirname(trustedSignalRegistryPath));
+  await fsp.writeFile(trustedSignalRegistryPath, JSON.stringify(registry, null, 2), 'utf8');
+}
+
+async function listSignalFilterFiles(dir) {
+  if (!(await fileExists(dir))) return [];
+  const entries = await fsp.readdir(dir, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && /\.(ya?ml|json)$/i.test(entry.name))
+    .map((entry) => path.join(dir, entry.name))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeSignalFilter(definition, sourcePath, scope) {
+  const parsed = isPlainObject(definition) ? definition : {};
+  const match = isPlainObject(parsed.match) ? parsed.match : {};
+  const rules = isPlainObject(parsed.rules) ? parsed.rules : {};
+  return {
+    name: String(parsed.name || path.basename(sourcePath, path.extname(sourcePath)) || 'signal-filter'),
+    description: parsed.description ? String(parsed.description) : '',
+    sourcePath,
+    scope,
+    trusted: scope === 'builtin',
+    active: scope === 'builtin',
+    match: {
+      command: readPatternList(match.command),
+      tool: readPatternList(match.tool),
+    },
+    rules: {
+      keep: readPatternList(rules.keep),
+      warn: readPatternList(rules.warn),
+      drop: readPatternList(rules.drop),
+      highlight: readPatternList(rules.highlight),
+    },
+  };
+}
+
+async function loadSignalFilterFile(filePath, scope) {
+  const raw = await fsp.readFile(filePath, 'utf8');
+  const ext = path.extname(filePath).toLowerCase();
+  const parsed = ext === '.json' ? JSON.parse(raw) : parsePresetYaml(raw);
+  if (!isPlainObject(parsed)) {
+    throw new Error(`signal filter must be an object: ${path.basename(filePath)}`);
+  }
+  return normalizeSignalFilter(parsed, filePath, scope);
+}
+
+async function loadSignalFilterCatalog() {
+  const builtins = [];
+  const workspaceFilters = [];
+  const registry = await readTrustedWorkspaceRegistry();
+  const workspaceEntry = isPlainObject(registry[realRoot]) ? registry[realRoot] : { filters: {} };
+  const trustedFiles = isPlainObject(workspaceEntry.filters) ? workspaceEntry.filters : {};
+
+  for (const filePath of await listSignalFilterFiles(builtinSignalFiltersRoot)) {
+    try {
+      builtins.push(await loadSignalFilterFile(filePath, 'builtin'));
+    } catch (error) {
+      builtins.push({
+        name: path.basename(filePath, path.extname(filePath)),
+        description: '',
+        sourcePath: filePath,
+        scope: 'builtin',
+        trusted: true,
+        active: true,
+        error: String(error?.message || error),
+        match: { command: [], tool: [] },
+        rules: { keep: [], warn: [], drop: [], highlight: [] },
+      });
+    }
+  }
+
+  for (const filePath of await listSignalFilterFiles(workspaceSignalFiltersRoot)) {
+    const rel = path.relative(root, filePath);
+    const trustedHash = String(trustedFiles[rel] || '').trim();
+    try {
+      const raw = await fsp.readFile(filePath, 'utf8');
+      const filter = await loadSignalFilterFile(filePath, 'workspace');
+      const fingerprint = sha256(raw);
+      const trusted = !!trustedHash && trustedHash === fingerprint;
+      workspaceFilters.push({
+        ...filter,
+        trusted,
+        active: trusted,
+        fingerprint,
+        trustKey: rel,
+      });
+    } catch (error) {
+      workspaceFilters.push({
+        name: path.basename(filePath, path.extname(filePath)),
+        description: '',
+        sourcePath: filePath,
+        scope: 'workspace',
+        trusted: !!trustedHash,
+        active: false,
+        error: String(error?.message || error),
+        match: { command: [], tool: [] },
+        rules: { keep: [], warn: [], drop: [], highlight: [] },
+        trustKey: rel,
+      });
+    }
+  }
+
+  return {
+    builtins,
+    workspace: workspaceFilters,
+  };
+}
+
+function selectSignalDistiller(commandText, filters = []) {
+  const command = String(commandText || '').trim();
+  const builtins = filters.filter((filter) => filter.scope === 'builtin' && filter.active);
+  const generic = builtins.find((filter) => filter.name === 'generic') || null;
+  const matched = builtins.find((filter) => filter.name !== 'generic' && textMatchesAnyPattern(command, filter.match.command)) || null;
+  const activeWorkspaceFilters = filters.filter((filter) => filter.scope === 'workspace' && filter.active && textMatchesAnyPattern(command, filter.match.command));
+  const selected = matched || generic || { name: 'generic', scope: 'builtin', rules: { keep: [], warn: [], drop: [], highlight: [] }, match: { command: [], tool: [] } };
+  const activeFilters = uniqueBy(
+    [generic, matched, ...activeWorkspaceFilters].filter(Boolean),
+    (filter) => `${filter.scope}:${filter.name}:${filter.sourcePath}`,
+  );
+  return {
+    name: selected.name || 'generic',
+    filters: activeFilters,
+    matchedFilters: activeFilters.map((filter) => ({
+      name: filter.name,
+      scope: filter.scope,
+      sourcePath: safeSignalPath(filter.sourcePath),
+    })),
+  };
+}
+
+function matchSignalFilterLine(line, filter) {
+  const rules = filter?.rules || {};
+  const keep = normalizeList(rules.keep).filter((pattern) => textMatchesPattern(line, pattern));
+  const warn = normalizeList(rules.warn).filter((pattern) => textMatchesPattern(line, pattern));
+  const drop = normalizeList(rules.drop).filter((pattern) => textMatchesPattern(line, pattern));
+  const highlight = normalizeList(rules.highlight).filter((pattern) => textMatchesPattern(line, pattern));
+  return {
+    keep,
+    warn,
+    drop,
+    highlight,
+  };
+}
+
+function summarizeFilterMatches(matches = []) {
+  const summary = [];
+  for (const match of matches) {
+    const filter = match.filter || match;
+    if (match.drop?.length) {
+      summary.push(`${filter.name}:drop:${match.drop.slice(0, 3).join('|')}`);
+    }
+    if (match.warn?.length) {
+      summary.push(`${filter.name}:warn:${match.warn.slice(0, 3).join('|')}`);
+    }
+    if (match.highlight?.length) {
+      summary.push(`${filter.name}:highlight:${match.highlight.slice(0, 3).join('|')}`);
+    }
+  }
+  return uniqueLines(summary).slice(0, 24);
+}
+
+async function trustWorkspaceSignalFilters() {
+  const files = await listSignalFilterFiles(workspaceSignalFiltersRoot);
+  const registry = await readTrustedWorkspaceRegistry();
+  const trustedFiles = {};
+  for (const filePath of files) {
+    const rel = path.relative(root, filePath);
+    const raw = await fsp.readFile(filePath, 'utf8');
+    trustedFiles[rel] = sha256(raw);
+  }
+  registry[realRoot] = {
+    trustedAt: nowIso(),
+    filters: trustedFiles,
+  };
+  await writeTrustedWorkspaceRegistry(registry);
+  return {
+    trustedAt: registry[realRoot].trustedAt,
+    workspace: realRoot,
+    files: Object.keys(trustedFiles).sort(),
+  };
+}
+
 function uniqueLines(lines) {
   const seen = new Set();
   const out = [];
@@ -315,55 +657,97 @@ function uniqueLines(lines) {
   return out;
 }
 
-function distillSignalText(text, options = {}) {
+function distillSignalText(text, options = {}, filters = [], commandText = '') {
   const normalized = normalizeSignalText(text);
   const rawLines = normalized.split('\n').map((line) => line.replace(/\s+$/, ''));
   const compactLines = [];
   let previous = null;
+  const removedPatterns = new Set();
 
   for (const line of rawLines) {
     const trimmed = line.trim();
     if (!trimmed) {
-      if (previous !== '') compactLines.push('');
+      if (previous !== '') {
+        compactLines.push('');
+      } else {
+        removedPatterns.add('duplicate blank lines');
+      }
       previous = '';
       continue;
     }
 
-    if (trimmed === previous) continue;
+    if (trimmed === previous) {
+      removedPatterns.add('duplicate lines');
+      continue;
+    }
     previous = trimmed;
     compactLines.push(line);
   }
 
   const nonEmpty = compactLines.filter((line) => String(line).trim());
+  const signalLines = [];
   const errors = [];
   const warnings = [];
   const highlights = [];
+  const matchedFilters = [];
 
   for (const line of nonEmpty) {
+    const lineMatches = [];
+    for (const filter of Array.isArray(filters) ? filters : []) {
+      if (!filter || filter.active === false) continue;
+      const matches = matchSignalFilterLine(line, filter);
+      if (matches.keep.length || matches.warn.length || matches.drop.length || matches.highlight.length) {
+        lineMatches.push({ filter, ...matches });
+      }
+    }
+
+    const dropHits = lineMatches.flatMap((match) => match.drop.map((pattern) => `${match.filter.name}:drop:${pattern}`));
+    const keepHits = lineMatches.flatMap((match) => match.keep.map((pattern) => `${match.filter.name}:keep:${pattern}`));
+    const warnHits = lineMatches.flatMap((match) => match.warn.map((pattern) => `${match.filter.name}:warn:${pattern}`));
+    const highlightHits = lineMatches.flatMap((match) => match.highlight.map((pattern) => `${match.filter.name}:highlight:${pattern}`));
+    const keepOverride = keepHits.length > 0;
+
+    if (dropHits.length && !keepOverride) {
+      for (const hit of dropHits.slice(0, 4)) removedPatterns.add(hit);
+      continue;
+    }
+
+    signalLines.push(line);
+
+    if (lineMatches.length) {
+      matchedFilters.push(
+        ...lineMatches.map((match) => ({
+          name: match.filter.name,
+          scope: match.filter.scope,
+          sourcePath: safeSignalPath(match.filter.sourcePath),
+        })),
+      );
+    }
+
     if (/(error|failed|fail|exception|traceback|panic|fatal|segfault|permission denied|not found|timed out|timeout)/i.test(line)) {
       errors.push(line);
       continue;
     }
-    if (/(warn|warning|deprecated)/i.test(line)) {
+    if (warnHits.length || /(warn|warning|deprecated)/i.test(line)) {
       warnings.push(line);
       continue;
     }
-    if (/(success|succeeded|passed|built|compiled|installed|applied|completed|done|exit code)/i.test(line)) {
+    if (highlightHits.length || keepOverride || /(success|succeeded|passed|built|compiled|installed|applied|completed|done|exit code)/i.test(line)) {
       highlights.push(line);
     }
   }
 
   const headCount = Math.max(4, Math.min(Number(options.headCount || 8), 20));
   const tailCount = Math.max(4, Math.min(Number(options.tailCount || 8), 20));
-  const excerpt = compactLines.slice(0, headCount);
-  const tail = compactLines.slice(-tailCount);
+  const excerpt = signalLines.slice(0, headCount);
+  const tail = signalLines.slice(-tailCount);
   const keyLines = uniqueLines([...errors, ...warnings, ...highlights]).slice(0, 24);
 
   for (const line of keyLines) {
     if (!excerpt.includes(line)) excerpt.push(line);
   }
 
-  if (compactLines.length > excerpt.length + tail.length) {
+  if (signalLines.length > excerpt.length + tail.length) {
     excerpt.push('...');
   }
   for (const line of tail) {
@@ -371,7 +755,7 @@ function distillSignalText(text, options = {}) {
   }
 
   const sourceLineCount = compactLines.length;
-  const keptLineCount = excerpt.filter((line) => String(line).trim()).length;
+  const keptLineCount = signalLines.filter((line) => String(line).trim()).length;
   const headline = errors.length
     ? 'signal contains errors'
     : warnings.length
@@ -384,6 +768,8 @@ function distillSignalText(text, options = {}) {
     errors: uniqueLines(errors).slice(0, 12),
     warnings: uniqueLines(warnings).slice(0, 12),
     excerpt: excerpt.join('\n'),
+    removedPatterns: uniqueLines([...removedPatterns, ...summarizeFilterMatches(matchedFilters)]).slice(0, 24),
+    matchedFilters: uniqueBy(matchedFilters, (item) => `${item.scope}:${item.name}:${item.sourcePath}`),
     stats: {
       sourceLineCount,
       keptLineCount,
@@ -521,7 +907,7 @@ function parsePresetYaml(text) {
           const childIndent = peekIndent();
           item = childIndent !== null && childIndent > expectedIndent ? parseBlock(expectedIndent + 2) : {};
         } else {
-          const inline = parsePresetInlineMapping(payload);
+          const inline = /^['"\[{]/.test(payload) ? null : parsePresetInlineMapping(payload);
           if (inline) {
             item = { [inline.key]: inline.value };
             const childIndent = peekIndent();
@@ -620,6 +1006,8 @@ function workflowToolCategory(name) {
   if (['write', 'edit', 'apply_patch'].includes(name)) return 'filesystem-write';
   if (['bash', 'bash_status', 'bash_tail', 'bash_result', 'bash_kill'].includes(name)) return 'shell';
   if (name === 'webfetch') return 'network';
+  if (['job_retrieve', 'signal_diff', 'signal_filters'].includes(name)) return 'workflow-read';
+  if (name === 'trust_workspace_filters') return 'workflow-control';
   if (['workflow', 'workflow_cancel'].includes(name)) return 'workflow-control';
   if (['workflow_presets', 'workflow_status', 'workflow_result', 'signal'].includes(name)) return 'workflow-read';
   return 'other';
@@ -646,7 +1034,7 @@ function workflowStepAllowed(step, permissions) {
 }
 
 function isToolEnabled(name) {
-  if (['read', 'glob', 'grep', 'codesearch', 'lsp', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result'].includes(name)) {
+  if (['read', 'glob', 'grep', 'codesearch', 'lsp', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result', 'job_retrieve', 'signal_diff', 'signal_filters', 'trust_workspace_filters'].includes(name)) {
     return true;
   }
   if (['write', 'edit', 'apply_patch'].includes(name)) return enableWriteTools;
@@ -766,18 +1154,6 @@ async function resolveWorkflowPlan(args) {
     throw new Error('workflow requires steps or preset');
   }
 
-  for (const step of steps) {
-    if (!TOOL_NAMES.has(step.tool)) {
-      throw new Error(`unknown workflow tool: ${step.tool}`);
-    }
-    if (!isToolEnabled(step.tool)) {
-      throw new Error(`workflow tool disabled: ${step.tool}`);
-    }
-    if (!workflowStepAllowed(step, permissions)) {
-      throw new Error(`workflow step not allowed by permissions: ${step.tool}`);
-    }
-  }
-
   return {
     name: name || 'workflow',
     description,
@@ -785,6 +1161,24 @@ async function resolveWorkflowPlan(args) {
     permissions,
     preset,
   };
+}
+
+function validateWorkflowPlan(plan) {
+  const errors = [];
+  for (const step of plan.steps) {
+    if (!TOOL_NAMES.has(step.tool)) {
+      errors.push(`unknown workflow tool: ${step.tool}`);
+      continue;
+    }
+    if (!isToolEnabled(step.tool)) {
+      errors.push(`workflow tool disabled: ${step.tool}`);
+      continue;
+    }
+    if (!workflowStepAllowed(step, plan.permissions)) {
+      errors.push(`workflow step not allowed by permissions: ${step.tool}`);
+    }
+  }
+  return uniqueLines(errors);
 }
 
 function globToRegExp(pattern) {
@@ -811,8 +1205,9 @@ function globToRegExp(pattern) {
 }
 
 function getToolAnnotations(name) {
-  const readOnly = ['read', 'glob', 'grep', 'webfetch', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result'];
+  const readOnly = ['read', 'glob', 'grep', 'webfetch', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result', 'job_retrieve', 'signal_diff', 'signal_filters'];
   const writeTools = ['write', 'edit', 'apply_patch', 'bash', 'bash_status', 'bash_tail', 'bash_result', 'bash_kill', 'workflow', 'workflow_cancel'];
+  const configTools = ['trust_workspace_filters'];
 
   if (readOnly.includes(name)) {
     return {
@@ -828,6 +1223,15 @@ function getToolAnnotations(name) {
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
+      openWorldHint: false,
+    };
+  }
+
+  if (configTools.includes(name)) {
+    return {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
       openWorldHint: false,
     };
   }
@@ -1004,6 +1408,42 @@ const TOOLS = [
     required: ['jobId'],
     additionalProperties: false,
   }),
+  baseTool('job_retrieve', 'Retrieve raw log content for a job by rewind ref or job id.', {
+    type: 'object',
+    properties: {
+      ref: { type: 'string', description: 'Rewind reference such as rewind:job_xxx:stdout.' },
+      jobId: { type: 'string' },
+      stream: { type: 'string', enum: ['stdout', 'stderr', 'combined', 'trace'] },
+      maxBytes: { type: 'number', default: 50000 },
+      mode: { type: 'string', enum: ['tail', 'head'], default: 'tail' },
+    },
+    additionalProperties: false,
+  }),
+  baseTool('signal_diff', 'Compare raw job output with distilled signal output.', {
+    type: 'object',
+    properties: {
+      jobId: { type: 'string' },
+      lines: { type: 'number', default: 300 },
+      includeRaw: { type: 'boolean', default: false },
+    },
+    required: ['jobId'],
+    additionalProperties: false,
+  }),
+  baseTool('signal_filters', 'Inspect signal filters and matching distillers.', {
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      command: { type: 'string', description: 'Optional command string to inspect matching filters.' },
+      includeInactive: { type: 'boolean', default: true },
+      workspaceOnly: { type: 'boolean', default: false },
+    },
+    additionalProperties: false,
+  }),
+  baseTool('trust_workspace_filters', 'Trust local workspace signal filters for the current workspace.', {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  }),
   baseTool('workflow', 'Run a batch of tool steps or a named workflow preset as one background job.', {
     type: 'object',
     properties: {
@@ -1169,7 +1609,7 @@ async function restoreJobs() {
 }
 
 function jobIsTerminal(job) {
-  return ['completed', 'failed', 'cancelled', 'timed_out'].includes(job?.status);
+  return ['completed', 'failed', 'cancelled', 'timed_out', 'rejected'].includes(job?.status);
 }
 
 async function cleanupJobsOnce() {
@@ -1257,7 +1697,7 @@ async function spawnBashJob(command, cwd, timeoutMs, description) {
     cwd,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
+    env: sanitizeBashEnvironment(process.env),
   });
 
   job.pid = child.pid;
@@ -1381,6 +1821,14 @@ async function runTool(name, args, ctx = {}) {
       return handleWorkflowPresets(args);
     case 'signal':
       return handleSignal(args);
+    case 'job_retrieve':
+      return handleJobRetrieve(args);
+    case 'signal_diff':
+      return handleSignalDiff(args);
+    case 'signal_filters':
+      return handleSignalFilters(args);
+    case 'trust_workspace_filters':
+      return handleTrustWorkspaceFilters(args);
     case 'workflow':
       return handleWorkflow(args, ctx);
     case 'workflow_status':
@@ -1704,11 +2152,11 @@ function summarizeWorkflowTrace(trace = []) {
   for (let i = 0; i < trace.length; i += 1) {
     const entry = trace[i] || {};
     const tool = String(entry.tool || `step ${i + 1}`);
-    const result = asText(entry.result);
+    const result = redactSecrets(asText(entry.result));
     if (result) {
       lines.push(`[${i + 1}] ${tool}: ${result.slice(0, 4000)}`);
     } else if (entry.error) {
-      lines.push(`[${i + 1}] ${tool}: error: ${asText(entry.error).slice(0, 4000)}`);
+      lines.push(`[${i + 1}] ${tool}: error: ${redactSecrets(asText(entry.error)).slice(0, 4000)}`);
     }
   }
   return lines.join('\n');
@@ -1721,10 +2169,13 @@ function collectTraceArtifacts(trace = []) {
     const tool = String(entry?.tool || '');
     const input = isPlainObject(entry?.input) ? entry.input : {};
     if (tool === 'bash' && typeof input.command === 'string' && input.command.trim()) {
-      commandsRun.push(input.command.trim());
+      commandsRun.push(redactSecrets(input.command.trim()));
     }
-    if (['write', 'edit', 'apply_patch'].includes(tool) && typeof input.path === 'string' && input.path.trim()) {
-      filesTouched.push(input.path.trim());
+    if (['write', 'edit'].includes(tool) && typeof (input.path || input.filePath) === 'string' && String(input.path || input.filePath).trim()) {
+      filesTouched.push(String(input.path || input.filePath).trim());
+    }
+    if (tool === 'apply_patch' && typeof input.patch === 'string') {
+      filesTouched.push(...extractPatchPaths(input.patch));
     }
   }
   return {
@@ -1735,51 +2186,61 @@ function collectTraceArtifacts(trace = []) {
 
 async function buildJobSignal(job, options = {}) {
   const lineCount = normalizeLineCount(options.lines, 300);
-  const stdout = await readTail(job.stdoutPath, lineCount);
-  const stderr = await readTail(job.stderrPath, lineCount);
-  const chunks = [
-    `job: ${job.jobId}`,
-    `kind: ${job.kind}`,
-    `title: ${job.title}`,
-    `status: ${job.status}`,
-  ];
-
-  if (job.exitCode !== null && job.exitCode !== undefined) {
-    chunks.push(`exitCode: ${job.exitCode}`);
-  }
-  if (job.signal) {
-    chunks.push(`signal: ${job.signal}`);
-  }
-  if (job.message) {
-    chunks.push(`message: ${job.message}`);
-  }
-  if (job.error) {
-    chunks.push(`error: ${job.error}`);
-  }
-  if (job.kind === 'workflow' && job.result?.trace) {
-    chunks.push(`trace:\n${summarizeWorkflowTrace(job.result.trace)}`);
-  }
-  if (stdout) {
-    chunks.push(`stdout:\n${stdout}`);
-  }
-  if (stderr) {
-    chunks.push(`stderr:\n${stderr}`);
-  }
-
-  const distilled = distillSignalText(chunks.join('\n\n'), options);
+  const stdoutRaw = await readTail(job.stdoutPath, lineCount);
+  const stderrRaw = await readTail(job.stderrPath, lineCount);
   const workflowArtifacts = job.kind === 'workflow' && job.result?.trace
     ? collectTraceArtifacts(job.result.trace)
     : { commandsRun: job.command ? [job.command] : [], filesTouched: [] };
-  const nextAction = job.status === 'completed'
-    ? 'inspect the result or continue with the next step'
-  : job.status === 'failed'
-    ? 'read stderr and fix the failing command'
+  const commandText = String(workflowArtifacts.commandsRun[0] || job.command || '').trim();
+  const traceText = job.kind === 'workflow' && job.result?.trace ? redactSecrets(summarizeWorkflowTrace(job.result.trace)) : '';
+  const stdout = redactSecrets(stdoutRaw);
+  const stderr = redactSecrets(stderrRaw);
+  const logText = [traceText, stdout ? `stdout:\n${stdout}` : '', stderr ? `stderr:\n${stderr}` : '']
+    .filter(Boolean)
+    .join('\n\n');
+  const filterCatalog = await loadSignalFilterCatalog();
+  const signalProfile = selectSignalDistiller(commandText, [...filterCatalog.builtins, ...filterCatalog.workspace]);
+  const distilled = distillSignalText(logText, options, signalProfile.filters, commandText);
+  const commandsRun = uniqueLines(workflowArtifacts.commandsRun).map((command) => redactSecrets(command));
+  const filesTouched = uniqueLines(workflowArtifacts.filesTouched);
+  const errors = uniqueLines([
+    ...(job.status === 'rejected' && job.error ? [redactSecrets(job.error)] : []),
+    ...distilled.errors,
+  ]).filter(Boolean);
+  const warnings = uniqueLines(distilled.warnings).filter(Boolean);
+  const headline = job.status === 'rejected'
+    ? 'workflow rejected by permissions'
     : job.status === 'timed_out'
-      ? 'rerun with a longer timeout or split the job into smaller steps'
-    : job.status === 'cancelled'
-      ? 'resume the workflow from the last successful step if needed'
-      : 'poll status or tail the job output';
-  return {
+      ? 'job timed out'
+      : job.status === 'failed'
+        ? 'job failed'
+        : errors.length > 0
+          ? 'signal contains errors'
+          : warnings.length > 0
+            ? 'signal contains warnings'
+            : 'signal extracted';
+  const combinedFeedback = `${errors.join('\n')}\n${warnings.join('\n')}\n${stdout}\n${stderr}`.trim();
+  const nextAction = job.status === 'rejected'
+    ? 'enable the missing permission in the preset or remove the blocked step'
+    : job.status === 'timed_out'
+      ? 'increase timeoutMs, split the job into smaller steps, or inspect partial output'
+      : /permission denied/i.test(combinedFeedback)
+        ? 'check workspace permissions or tool gating'
+        : /not found/i.test(combinedFeedback)
+          ? 'check command availability, path, or preset references'
+          : job.status === 'failed'
+            ? 'read stderr and fix the failing command'
+            : warnings.length > 0
+              ? 'review warnings before continuing'
+              : 'continue with the next step';
+  const summaryText = buildSignalSummaryText({
+    headline,
+    nextAction,
+    keyLines: distilled.keyLines,
+    errors,
+    warnings,
+  });
+  const signalPayload = {
     jobId: job.jobId,
     kind: job.kind,
     title: job.title,
@@ -1787,22 +2248,43 @@ async function buildJobSignal(job, options = {}) {
     childJobId: job.childJobId || null,
     presetName: job.presetName || null,
     presetPath: job.presetPath || null,
-    headline: distilled.headline,
+    distiller: signalProfile.name || 'generic',
+    headline,
     keyLines: distilled.keyLines,
-    errors: distilled.errors,
-    warnings: distilled.warnings,
+    errors,
+    warnings,
     excerpt: distilled.excerpt,
-    stats: distilled.stats,
+    stats: {
+      ...distilled.stats,
+      rawChars: logText.length,
+      signalChars: summaryText.length,
+      estimatedRawTokens: estimateTokens(logText),
+      estimatedSignalTokens: estimateTokens(summaryText),
+      estimatedReductionPct: logText.length > 0
+        ? Math.max(0, Math.round((1 - (summaryText.length / logText.length)) * 1000) / 10)
+        : 0,
+    },
     nextAction,
-    commandsRun: workflowArtifacts.commandsRun,
-    filesTouched: workflowArtifacts.filesTouched,
+    commandsRun,
+    filesTouched,
+    removedPatterns: distilled.removedPatterns || [],
+    matchedFilters: distilled.matchedFilters || signalProfile.matchedFilters || [],
+    rewind: {
+      available: true,
+      stdoutRef: `rewind:${job.jobId}:stdout`,
+      stderrRef: `rewind:${job.jobId}:stderr`,
+      combinedRef: `rewind:${job.jobId}:combined`,
+      traceRef: `rewind:${job.jobId}:trace`,
+    },
     rawPaths: {
-      stdout: job.stdoutPath,
-      stderr: job.stderrPath,
+      stdout: safeSignalPath(job.stdoutPath),
+      stderr: safeSignalPath(job.stderrPath),
     },
     includeRaw: !!options.includeRaw,
+    rawWarning: options.includeRaw ? 'raw output may contain secrets; use carefully' : undefined,
     raw: options.includeRaw ? { stdout, stderr } : undefined,
   };
+  return signalPayload;
 }
 
 async function handleSignal(args) {
@@ -1811,6 +2293,233 @@ async function handleSignal(args) {
   const signal = await buildJobSignal(job, args);
   return {
     content: okContent(JSON.stringify(signal, null, 2)),
+  };
+}
+
+function parseJobRewindRef(args) {
+  const ref = String(args.ref || '').trim();
+  const jobId = String(args.jobId || '').trim();
+  const stream = String(args.stream || '').trim() || 'combined';
+
+  if (ref) {
+    if (ref.startsWith('rewind:')) {
+      const parts = ref.split(':');
+      if (parts.length < 3 || !parts[1] || !parts[2]) {
+        throw new Error(`invalid rewind ref: ${ref}`);
+      }
+      return {
+        ref,
+        jobId: parts[1],
+        stream: parts[2],
+      };
+    }
+    return {
+      ref: `rewind:${ref}:${stream}`,
+      jobId: ref,
+      stream,
+    };
+  }
+
+  if (!jobId) {
+    throw new Error('jobId or ref is required');
+  }
+
+  return {
+    ref: `rewind:${jobId}:${stream}`,
+    jobId,
+    stream,
+  };
+}
+
+async function readJobStream(job, stream, maxBytes = 50000, mode = 'tail') {
+  const normalizedStream = String(stream || 'combined').trim() || 'combined';
+  const limit = Math.max(1024, Number(maxBytes || 50000));
+
+  if (normalizedStream === 'trace') {
+    const trace = Array.isArray(job.result?.trace) ? JSON.stringify(job.result.trace, null, 2) : '';
+    const clipped = trace.length > limit
+      ? mode === 'head'
+        ? trace.slice(0, limit)
+        : trace.slice(Math.max(0, trace.length - limit))
+      : trace;
+    return {
+      text: clipped,
+      bytes: Buffer.byteLength(trace, 'utf8'),
+      truncated: trace.length > limit,
+    };
+  }
+
+  if (normalizedStream === 'stdout') {
+    return readFileWindow(job.stdoutPath, limit, mode);
+  }
+
+  if (normalizedStream === 'stderr') {
+    return readFileWindow(job.stderrPath, limit, mode);
+  }
+
+  const stdout = await readTextIfExists(job.stdoutPath);
+  const stderr = await readTextIfExists(job.stderrPath);
+  const combined = [
+    stdout ? `stdout:\n${stdout}` : '',
+    stderr ? `stderr:\n${stderr}` : '',
+  ].filter(Boolean).join('\n\n');
+  const bytes = Buffer.byteLength(combined, 'utf8');
+  const text = bytes > limit
+    ? mode === 'head'
+      ? combined.slice(0, limit)
+      : combined.slice(Math.max(0, combined.length - limit))
+    : combined;
+  return {
+    text,
+    bytes,
+    truncated: bytes > limit,
+  };
+}
+
+async function handleJobRetrieve(args) {
+  const refInfo = parseJobRewindRef(args);
+  const job = getJob(refInfo.jobId);
+  if (!job) throw new Error(`job not found: ${refInfo.jobId}`);
+  const stream = refInfo.stream === 'combined' || refInfo.stream === 'stdout' || refInfo.stream === 'stderr' || refInfo.stream === 'trace'
+    ? refInfo.stream
+    : 'combined';
+  const mode = String(args.mode || 'tail').trim() === 'head' ? 'head' : 'tail';
+  const payload = await readJobStream(job, stream, args.maxBytes, mode);
+  return {
+    content: okContent(JSON.stringify({
+      ref: refInfo.ref,
+      jobId: job.jobId,
+      kind: job.kind,
+      title: job.title,
+      stream,
+      mode,
+      bytes: payload.bytes,
+      truncated: payload.truncated,
+      content: payload.text,
+    }, null, 2)),
+  };
+}
+
+function buildSignalPreviewText(signal) {
+  const preview = {
+    jobId: signal.jobId,
+    kind: signal.kind,
+    status: signal.status,
+    headline: signal.headline,
+    nextAction: signal.nextAction,
+    keyLines: signal.keyLines,
+    errors: signal.errors,
+    warnings: signal.warnings,
+    distiller: signal.distiller,
+  };
+  return JSON.stringify(preview, null, 2);
+}
+
+async function handleSignalDiff(args) {
+  const job = getJob(args.jobId);
+  if (!job) throw new Error(`job not found: ${args.jobId}`);
+  const signal = await buildJobSignal(job, args);
+  const lineCount = normalizeLineCount(args.lines, 300);
+  const rawPreviewParts = [];
+  if (job.kind === 'workflow' && Array.isArray(job.result?.trace) && job.result.trace.length) {
+    rawPreviewParts.push(redactSecrets(summarizeWorkflowTrace(job.result.trace)).slice(0, 12000));
+  }
+  const stdout = redactSecrets(await readTail(job.stdoutPath, lineCount));
+  const stderr = redactSecrets(await readTail(job.stderrPath, lineCount));
+  if (stdout) rawPreviewParts.push(`stdout:\n${stdout}`);
+  if (stderr) rawPreviewParts.push(`stderr:\n${stderr}`);
+  const rawPreview = rawPreviewParts.filter(Boolean).join('\n\n');
+  return {
+    content: okContent(JSON.stringify({
+      jobId: job.jobId,
+      kind: job.kind,
+      status: job.status,
+      distiller: signal.distiller,
+      rawPreview,
+      signalPreview: buildSignalPreviewText(signal),
+      removedPatterns: signal.removedPatterns || [],
+      reductionPct: signal.stats?.estimatedReductionPct ?? null,
+      metrics: signal.stats,
+      rewind: signal.rewind,
+    }, null, 2)),
+  };
+}
+
+async function handleSignalFilters(args) {
+  const catalog = await loadSignalFilterCatalog();
+  const name = String(args.name || '').trim();
+  const command = String(args.command || '').trim();
+  const includeInactive = args.includeInactive !== false;
+  const workspaceOnly = args.workspaceOnly === true;
+  const filters = workspaceOnly
+    ? [...catalog.workspace]
+    : [...catalog.builtins, ...catalog.workspace];
+  const filtered = includeInactive ? filters : filters.filter((filter) => filter.active);
+  const selected = command ? selectSignalDistiller(command, filtered) : null;
+  const matchFilters = command
+    ? filtered.filter((filter) => {
+        if (!filter.active) return false;
+        if (!filter.match?.command?.length) return true;
+        return textMatchesAnyPattern(command, filter.match.command);
+      })
+    : [];
+
+  if (name) {
+    const found = filtered.find((filter) => filter.name === name);
+    if (!found) throw new Error(`signal filter not found: ${name}`);
+    return {
+      content: okContent(JSON.stringify({
+        filter: {
+          name: found.name,
+          description: found.description,
+          sourcePath: safeSignalPath(found.sourcePath),
+          scope: found.scope,
+          trusted: !!found.trusted,
+          active: !!found.active,
+          match: found.match,
+          rules: found.rules,
+          error: found.error || null,
+        },
+        distiller: selected?.name || null,
+        matchingFilters: selected?.matchedFilters || [],
+      }, null, 2)),
+    };
+  }
+
+  return {
+    content: okContent(JSON.stringify({
+      workspace: realRoot,
+      trustRegistry: trustedSignalRegistryPath,
+      distiller: selected?.name || null,
+      activeFilters: selected?.matchedFilters || matchFilters.map((filter) => ({
+        name: filter.name,
+        scope: filter.scope,
+        sourcePath: safeSignalPath(filter.sourcePath),
+      })),
+      filters: filtered.map((filter) => ({
+        name: filter.name,
+        description: filter.description,
+        sourcePath: safeSignalPath(filter.sourcePath),
+        scope: filter.scope,
+        trusted: !!filter.trusted,
+        active: !!filter.active,
+        match: filter.match,
+        rules: filter.rules,
+        error: filter.error || null,
+      })),
+    }, null, 2)),
+  };
+}
+
+async function handleTrustWorkspaceFilters() {
+  const result = await trustWorkspaceSignalFilters();
+  return {
+    content: okContent(JSON.stringify({
+      workspace: result.workspace,
+      trustedAt: result.trustedAt,
+      files: result.files,
+      registry: trustedSignalRegistryPath,
+    }, null, 2)),
   };
 }
 
@@ -1870,9 +2579,77 @@ function safeJsonFromContent(result) {
   }
 }
 
+function buildWorkflowPreflightErrors(plan) {
+  const errors = [];
+  for (const step of plan.steps) {
+    if (!TOOL_NAMES.has(step.tool)) {
+      errors.push(`unknown workflow tool: ${step.tool}`);
+      continue;
+    }
+    if (!isToolEnabled(step.tool)) {
+      errors.push(`workflow tool disabled: ${step.tool}`);
+      continue;
+    }
+    if (!workflowStepAllowed(step, plan.permissions)) {
+      errors.push(`workflow step not allowed by permissions: ${step.tool}`);
+    }
+  }
+  return uniqueLines(errors);
+}
+
+function buildWorkflowPreflightPayload(job, errors, plan, extra = {}) {
+  const headline = 'workflow rejected by permissions';
+  const nextAction = errors.some((error) => /bash|shell/i.test(error))
+    ? 'enable shell permissions in the preset or remove the blocked shell step'
+    : errors.some((error) => /write|edit|apply_patch/i.test(error))
+      ? 'enable write permissions in the preset or remove the blocked write step'
+      : errors.some((error) => /network|webfetch/i.test(error))
+        ? 'enable network permissions or remove the blocked network step'
+        : 'adjust the preset permissions or remove the blocked step';
+  return {
+    kind: 'workflow_preflight_error',
+    status: 'rejected',
+    jobId: job.jobId,
+    headline,
+    errors,
+    nextAction,
+    presetName: plan?.preset?.name || null,
+    presetPath: plan?.preset?.sourcePath || null,
+    permissions: plan?.permissions || null,
+    ...extra,
+  };
+}
+
 async function handleWorkflow(args) {
-  const plan = await resolveWorkflowPlan(args);
   const stopOnError = args.stopOnError !== false;
+  let plan;
+  try {
+    plan = await resolveWorkflowPlan(args);
+  } catch (error) {
+    const rejectedJob = createJob('workflow', String(args.name || args.preset || 'workflow'), {});
+    await markJob(rejectedJob, {
+      status: 'rejected',
+      startedAt: nowIso(),
+      finishedAt: nowIso(),
+      message: String(error?.message || error),
+      error: String(error?.stack || error),
+      result: {
+        kind: 'workflow_preflight_error',
+        status: 'rejected',
+        headline: 'workflow rejected',
+        errors: [String(error?.message || error)],
+        nextAction: 'fix the preset or step list and try again',
+      },
+    });
+    return {
+      content: okContent(JSON.stringify(buildWorkflowPreflightPayload(rejectedJob, [String(error?.message || error)], null, {
+        message: String(error?.message || error),
+      }), null, 2)),
+      isError: true,
+    };
+  }
+
+  const preflightErrors = buildWorkflowPreflightErrors(plan);
   const job = createJob('workflow', plan.name || 'workflow', {
     totalSteps: plan.steps.length,
     currentStep: 0,
@@ -1880,6 +2657,37 @@ async function handleWorkflow(args) {
     presetPath: plan.preset?.sourcePath || null,
     permissions: plan.permissions,
   });
+
+  if (preflightErrors.length) {
+    await markJob(job, {
+      status: 'rejected',
+      startedAt: nowIso(),
+      finishedAt: nowIso(),
+      message: 'workflow rejected by permissions',
+      error: preflightErrors.join('\n'),
+      result: {
+        kind: 'workflow_preflight_error',
+        status: 'rejected',
+        headline: 'workflow rejected by permissions',
+        errors: preflightErrors,
+        nextAction: preflightErrors.some((error) => /bash|shell/i.test(error))
+          ? 'enable shell permissions in the preset or remove the blocked shell step'
+          : preflightErrors.some((error) => /write|edit|apply_patch/i.test(error))
+            ? 'enable write permissions in the preset or remove the blocked write step'
+            : preflightErrors.some((error) => /network|webfetch/i.test(error))
+              ? 'enable network permissions or remove the blocked network step'
+              : 'adjust the preset permissions or remove the blocked step',
+        presetName: plan.preset?.name || null,
+        presetPath: plan.preset?.sourcePath || null,
+        permissions: plan.permissions,
+      },
+    });
+    return {
+      content: okContent(JSON.stringify(buildWorkflowPreflightPayload(job, preflightErrors, plan), null, 2)),
+      isError: true,
+    };
+  }
+
   await markJob(job, {
     status: 'running',
     startedAt: nowIso(),
@@ -2015,11 +2823,15 @@ function buildDebugHealthPayload() {
     realWorkspace: realRoot,
     jobsDir: realJobsRoot,
     workflowPresetsDir: realWorkflowPresetsRoot,
+    signalFiltersDir: workspaceSignalFiltersRoot,
+    builtinSignalFiltersDir: builtinSignalFiltersRoot,
+    trustedSignalRegistryPath,
     authRequired: !!authToken || !allowNoAuth,
     allowNoAuth,
     allowQueryToken,
     allowOutside,
     responseMode,
+    sanitizeBashEnv,
     toolGating: {
       write: enableWriteTools,
       bash: enableBash,

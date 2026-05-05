@@ -1,0 +1,20 @@
+name: npm
+description: JavaScript package manager signal distiller.
+match:
+  command:
+    - "(^|\\s)(npm|pnpm|yarn)\\s+(test|run|build|install)(\\s|$)"
+rules:
+  keep:
+    - "ERR!"
+    - "\\bfail(ed|ure)?\\b"
+    - "\\berror\\b"
+  warn:
+    - "^warning:"
+  drop:
+    - "^> "
+    - "^Done in "
+    - "^Progress: "
+    - "^Packages: "
+  highlight:
+    - "passed"
+    - "succeeded"

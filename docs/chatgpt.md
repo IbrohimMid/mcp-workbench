@@ -16,5 +16,9 @@ For long-running tasks, prefer the async job flow:
 - `bash_tail`
 - `bash_result`
 - `signal`
+- `signal_diff`
+- `job_retrieve`
 
 If you want batched actions, call `workflow` with either inline steps or a named preset.
+If your workspace uses local signal filters, trust them once with `trust_workspace_filters` before expecting them to apply.
+Use `signal_filters` to inspect which filters and distillers are active, and `job_retrieve` when you need raw logs again.

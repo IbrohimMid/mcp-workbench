@@ -14,6 +14,10 @@ This template supports a job-based MCP workflow pattern for long-running actions
 - `workflow`: validate input, create a job, return immediately
 - `workflow_presets`: list or inspect named presets
 - `signal`: return a distilled summary for a job
+- `signal_diff`: compare raw previews with the distilled signal
+- `job_retrieve`: fetch raw output again from a rewind ref
+- `signal_filters`: inspect built-in and workspace-local filters
+- `trust_workspace_filters`: trust local filters for the current workspace
 - `workflow_status`: poll progress by `job_id`
 - `workflow_result`: fetch the final output by `job_id`
 - `workflow_cancel`: stop a queued or running job when supported
@@ -43,6 +47,7 @@ Returning a job id early keeps the transport short-lived and moves the expensive
 - Custom agents can usually work better with an async job model.
 - The server can reduce prompt pressure by batching work into one job.
 - The `signal` layer is useful when the raw shell output is noisy but the agent only needs the important lines.
+- The `job_retrieve` and `signal_diff` tools are useful when the agent needs the raw log again after reading the signal.
 
 ## Presets
 

@@ -1,0 +1,23 @@
+name: cargo
+description: Rust cargo signal distiller.
+match:
+  command:
+    - "(^|\\s)cargo\\s+(test|build|check)(\\s|$)"
+rules:
+  keep:
+    - "error\\[E[0-9]+\\]"
+    - "panicked at"
+    - "test result:"
+    - "^error:"
+  warn:
+    - "^warning:"
+  drop:
+    - "^Compiling "
+    - "^Finished "
+    - "^Running "
+    - "^Downloading "
+    - "^Updating "
+    - "^Checking "
+  highlight:
+    - "test result: FAILED"
+    - "test result: ok"

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
@@ -76,14 +76,74 @@ async function rpc(baseUrl, sessionId, method, params = {}, options = {}) {
 async function main() {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-workbench-smoke-'));
   const workspaceDir = path.join(tmp, 'workspace');
+  const generatedRoot = path.join(tmp, 'generated-repo');
+  const profilePath = path.join(tmp, 'dual-worker.yaml');
   const jobDir = path.join(workspaceDir, '.mcp-workbench', 'jobs');
   const presetDir = path.join(workspaceDir, 'workflow-presets');
+  const workspaceSignalFiltersDir = path.join(workspaceDir, '.mcp-workbench', 'signal-filters');
+  const secretValue = 'super-secret-123';
   await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(generatedRoot, { recursive: true });
   await fs.mkdir(jobDir, { recursive: true });
   await fs.mkdir(presetDir, { recursive: true });
+  await fs.mkdir(workspaceSignalFiltersDir, { recursive: true });
   await fs.writeFile(path.join(workspaceDir, 'hello.txt'), 'hello from smoke test\n', 'utf8');
   await fs.writeFile(path.join(tmp, 'outside.txt'), 'outside world\n', 'utf8');
   await fs.symlink(path.join(tmp, 'outside.txt'), path.join(workspaceDir, 'link-out'));
+
+  await fs.writeFile(
+    profilePath,
+    [
+      'name: smoke-dual-worker',
+      'description: Smoke profile for two YOLO workers',
+      'defaults:',
+      `  workspace: ${workspaceDir}`,
+      '  permission: yolo',
+      '  portBase: 3333',
+      '  tunnelMode: quick',
+      '  workflowMode: sync',
+      'workers:',
+      '  - name: chatgpt',
+      '    client: chatgpt',
+      '  - name: notion',
+      '    client: notion',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+
+  const generatedProfile = spawnSync(process.execPath, [
+    path.join(root, 'scripts', 'generate-worker.mjs'),
+    '--root', generatedRoot,
+    '--profile', profilePath,
+  ], { encoding: 'utf8' });
+  assert(generatedProfile.status === 0, `worker profile generator failed: ${generatedProfile.stderr || generatedProfile.stdout}`);
+
+  const chatgptEnvPath = path.join(generatedRoot, '.mcp-workbench', 'workers', 'chatgpt.env');
+  const notionEnvPath = path.join(generatedRoot, '.mcp-workbench', 'workers', 'notion.env');
+  const chatgptEnv = await fs.readFile(chatgptEnvPath, 'utf8');
+  const notionEnv = await fs.readFile(notionEnvPath, 'utf8');
+  assert(chatgptEnv.includes("MCP_SERVER_NAME='mcp-workbench-chatgpt'"), 'chatgpt env missing server name');
+  assert(chatgptEnv.includes("MCP_ENABLE_BASH='1'"), 'chatgpt env should enable bash for yolo');
+  assert(chatgptEnv.includes("MCP_ALLOW_OUTSIDE_WORKSPACE='0'"), 'chatgpt env should keep workspace boundary');
+  assert(chatgptEnv.includes("MCP_ENABLE_WRITE_TOOLS='1'"), 'chatgpt env should enable write tools for yolo');
+  assert(chatgptEnv.includes(`MCP_PORT='3333'`), 'chatgpt env port mismatch');
+  assert(notionEnv.includes("MCP_SERVER_NAME='mcp-workbench-notion'"), 'notion env missing server name');
+  assert(notionEnv.includes(`MCP_PORT='3334'`), 'notion env port mismatch');
+  assert(notionEnv.includes("MCP_ENABLE_WRITE_TOOLS='1'"), 'notion env should enable write tools for yolo');
+  assert(notionEnv.includes("MCP_ENABLE_BASH='1'"), 'notion env should enable bash for yolo');
+  assert(notionEnv.includes("MCP_ALLOW_OUTSIDE_WORKSPACE='0'"), 'notion env should keep workspace boundary');
+  assert(chatgptEnv !== notionEnv, 'worker env files should differ');
+
+  const workerDoctor = spawnSync('bash', ['-lc', 'WORKBENCH_ENV_FILE="$WORKBENCH_ENV_FILE" ./scripts/worker-doctor.sh chatgpt'], {
+    cwd: root,
+    env: {
+      ...process.env,
+      WORKBENCH_ENV_FILE: chatgptEnvPath,
+    },
+    encoding: 'utf8',
+  });
+  assert(workerDoctor.status === 0, `worker-doctor wrapper failed: ${workerDoctor.stderr || workerDoctor.stdout}`);
 
   await fs.writeFile(
     path.join(presetDir, 'smoke-preset.yaml'),
@@ -106,6 +166,49 @@ async function main() {
       '      command: printf smoke-preset-ok',
       '      timeoutMs: 0',
       '      cwd: .',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+
+  await fs.writeFile(
+    path.join(presetDir, 'smoke-apply-preset.yaml'),
+    [
+      'name: smoke-apply-preset',
+      'description: Smoke preset for apply_patch files touched',
+      'permissions:',
+      '  filesystem:',
+      '    read: true',
+      '    write: true',
+      '  shell:',
+      '    enabled: false',
+      '  network:',
+      '    enabled: false',
+      'steps:',
+      '  - tool: apply_patch',
+      '    description: Patch hello.txt',
+      '    wait: true',
+      '    arguments:',
+      '      cwd: .',
+      '      patch: "diff --git a/hello.txt b/hello.txt\\n--- a/hello.txt\\n+++ b/hello.txt\\n@@ -1 +1 @@\\n-hello from smoke test\\n+hello from smoke test patched\\n"',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+
+  await fs.writeFile(
+    path.join(workspaceSignalFiltersDir, 'local-signal-demo.yaml'),
+    [
+      'name: local-signal-demo',
+      'description: Trust-gated demo filter',
+      'match:',
+      '  command:',
+      '    - signal-filter-demo',
+      'rules:',
+      '  drop:',
+      '    - DROP-ME',
+      '  highlight:',
+      '    - KEEP-ME',
       '',
     ].join('\n'),
     'utf8',
@@ -198,7 +301,7 @@ async function main() {
     const tools = await rpc(baseUrl, sessionId, 'tools/list', {}, { id: 'tools' });
     assert(tools.status === 200, `tools/list failed with ${tools.status}`);
     const toolNames = (tools.body?.result?.tools || []).map((tool) => tool.name);
-    for (const required of ['read', 'write', 'edit', 'apply_patch', 'bash', 'workflow', 'workflow_presets', 'signal']) {
+    for (const required of ['read', 'write', 'edit', 'apply_patch', 'bash', 'workflow', 'workflow_presets', 'signal', 'job_retrieve', 'signal_diff', 'signal_filters', 'trust_workspace_filters']) {
       assert(toolNames.includes(required), `missing tool: ${required}`);
     }
 
@@ -274,6 +377,156 @@ async function main() {
     const signalJson = JSON.parse(signal.body?.result?.content?.[0]?.text || '{}');
     assert((signalJson.keyLines || []).some((line) => String(line).includes('WARNING: ignore this noise')), 'signal missing warning line');
     assert(String(signalJson.excerpt || '').includes('FINAL: ok'), 'signal missing final line');
+    assert(signalJson.rewind && signalJson.rewind.stdoutRef, 'signal missing rewind refs');
+
+    const cleanMetadata = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'bash',
+      arguments: {
+        command: 'printf "clean output\\n"',
+        cwd: '.',
+        description: 'warning title but clean output',
+      },
+    }, { id: 'clean-metadata' });
+    assert(cleanMetadata.status === 200, `clean metadata bash failed with ${cleanMetadata.status}`);
+    const cleanMetadataJson = JSON.parse(cleanMetadata.body?.result?.content?.[0]?.text || '{}');
+    const cleanMetadataJobId = cleanMetadataJson.jobId;
+    assert(cleanMetadataJobId, 'clean metadata job id missing');
+
+    let cleanMetadataSignal = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'signal',
+        arguments: { jobId: cleanMetadataJobId },
+      }, { id: `clean-metadata-signal-${i}` });
+      assert(statusRes.status === 200, `clean metadata signal failed with ${statusRes.status}`);
+      cleanMetadataSignal = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (cleanMetadataSignal.status && cleanMetadataSignal.status !== 'running' && cleanMetadataSignal.status !== 'queued') {
+        break;
+      }
+      await sleep(150);
+    }
+    assert(cleanMetadataSignal && cleanMetadataSignal.status === 'completed', `clean metadata job did not complete: ${JSON.stringify(cleanMetadataSignal)}`);
+    assert(cleanMetadataSignal.headline === 'signal extracted', `metadata false positive leaked into headline: ${cleanMetadataSignal.headline}`);
+    assert((cleanMetadataSignal.warnings || []).length === 0, 'metadata false positive leaked into warnings');
+    assert((cleanMetadataSignal.errors || []).length === 0, 'metadata false positive leaked into errors');
+
+    const secretJob = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'bash',
+      arguments: {
+        command: [
+          `printf 'token=${secretValue}\\n'`,
+          `printf 'Authorization: Bearer ${secretValue}\\n'`,
+          'printf "secret job done\\n"',
+        ].join('; '),
+        cwd: '.',
+        description: 'secret redaction smoke test',
+      },
+    }, { id: 'secret-job' });
+    assert(secretJob.status === 200, `secret bash failed with ${secretJob.status}`);
+    const secretJobJson = JSON.parse(secretJob.body?.result?.content?.[0]?.text || '{}');
+    const secretJobId = secretJobJson.jobId;
+    assert(secretJobId, 'secret job id missing');
+
+    let secretSignal = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'signal',
+        arguments: { jobId: secretJobId, includeRaw: true },
+      }, { id: `secret-signal-${i}` });
+      assert(statusRes.status === 200, `secret signal failed with ${statusRes.status}`);
+      secretSignal = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (secretSignal.status && secretSignal.status !== 'running' && secretSignal.status !== 'queued') {
+        break;
+      }
+      await sleep(150);
+    }
+    assert(secretSignal && secretSignal.status === 'completed', `secret job did not complete: ${JSON.stringify(secretSignal)}`);
+    const secretBlob = JSON.stringify(secretSignal);
+    assert(!secretBlob.includes(secretValue), 'secret leaked into signal JSON');
+    assert(secretSignal.rawWarning, 'includeRaw should surface a warning');
+    assert(secretSignal.rawPaths && !path.isAbsolute(secretSignal.rawPaths.stdout), 'raw stdout path should not be absolute');
+    assert(secretSignal.raw && !JSON.stringify(secretSignal.raw).includes(secretValue), 'secret leaked into raw signal output');
+
+    const filtersBeforeTrust = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'signal_filters',
+      arguments: {},
+    }, { id: 'filters-before-trust' });
+    assert(filtersBeforeTrust.status === 200, `signal_filters failed with ${filtersBeforeTrust.status}`);
+    const filtersBeforeTrustJson = JSON.parse(filtersBeforeTrust.body?.result?.content?.[0]?.text || '{}');
+    const localFilterBefore = (filtersBeforeTrustJson.filters || []).find((filter) => filter.name === 'local-signal-demo');
+    assert(localFilterBefore, 'local filter not listed');
+    assert(localFilterBefore.trusted === false, 'local filter should start untrusted');
+    assert(localFilterBefore.active === false, 'local filter should start inactive');
+
+    const untrustedLocalJob = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'bash',
+      arguments: {
+        command: 'echo signal-filter-demo; printf "KEEP-ME\\nDROP-ME\\nDONE\\n"',
+        cwd: '.',
+        description: 'signal-filter-demo untrusted',
+      },
+    }, { id: 'untrusted-local-job' });
+    assert(untrustedLocalJob.status === 200, `untrusted local bash failed with ${untrustedLocalJob.status}`);
+    const untrustedLocalJobJson = JSON.parse(untrustedLocalJob.body?.result?.content?.[0]?.text || '{}');
+    const untrustedLocalJobId = untrustedLocalJobJson.jobId;
+    assert(untrustedLocalJobId, 'untrusted local job id missing');
+    let untrustedLocalSignal = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'signal',
+        arguments: { jobId: untrustedLocalJobId },
+      }, { id: `untrusted-local-signal-${i}` });
+      assert(statusRes.status === 200, `untrusted local signal failed with ${statusRes.status}`);
+      untrustedLocalSignal = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (untrustedLocalSignal.status && untrustedLocalSignal.status !== 'running' && untrustedLocalSignal.status !== 'queued') {
+        break;
+      }
+      await sleep(150);
+    }
+    assert(String(untrustedLocalSignal.excerpt || '').includes('DROP-ME'), 'untrusted filter should not apply yet');
+
+    const trustFilters = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'trust_workspace_filters',
+      arguments: {},
+    }, { id: 'trust-filters' });
+    assert(trustFilters.status === 200, `trust_workspace_filters failed with ${trustFilters.status}`);
+
+    const filtersAfterTrust = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'signal_filters',
+      arguments: {},
+    }, { id: 'filters-after-trust' });
+    assert(filtersAfterTrust.status === 200, `signal_filters after trust failed with ${filtersAfterTrust.status}`);
+    const filtersAfterTrustJson = JSON.parse(filtersAfterTrust.body?.result?.content?.[0]?.text || '{}');
+    const localFilterAfter = (filtersAfterTrustJson.filters || []).find((filter) => filter.name === 'local-signal-demo');
+    assert(localFilterAfter && localFilterAfter.trusted === true, 'local filter should be trusted after trust_workspace_filters');
+    assert(localFilterAfter && localFilterAfter.active === true, 'local filter should be active after trust_workspace_filters');
+
+    const trustedLocalJob = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'bash',
+      arguments: {
+        command: 'echo signal-filter-demo; printf "KEEP-ME\\nDROP-ME\\nDONE\\n"',
+        cwd: '.',
+        description: 'signal-filter-demo trusted',
+      },
+    }, { id: 'trusted-local-job' });
+    assert(trustedLocalJob.status === 200, `trusted local bash failed with ${trustedLocalJob.status}`);
+    const trustedLocalJobJson = JSON.parse(trustedLocalJob.body?.result?.content?.[0]?.text || '{}');
+    const trustedLocalJobId = trustedLocalJobJson.jobId;
+    assert(trustedLocalJobId, 'trusted local job id missing');
+    let trustedLocalSignal = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'signal',
+        arguments: { jobId: trustedLocalJobId },
+      }, { id: `trusted-local-signal-${i}` });
+      assert(statusRes.status === 200, `trusted local signal failed with ${statusRes.status}`);
+      trustedLocalSignal = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (trustedLocalSignal.status && trustedLocalSignal.status !== 'running' && trustedLocalSignal.status !== 'queued') {
+        break;
+      }
+      await sleep(150);
+    }
+    assert(!String(trustedLocalSignal.excerpt || '').includes('DROP-ME'), 'trusted local filter should drop DROP-ME');
 
     const debugHealth = await fetch(`${baseUrl}/debug/health`, {
       headers: {
@@ -327,6 +580,117 @@ async function main() {
     const trace = workflowResultJson.result?.trace || [];
     assert(trace.length > 0, 'workflow trace is empty');
     assert(String(trace[0]?.result || '').includes('smoke-preset-ok'), 'workflow preset result mismatch');
+
+    const applyWorkflowStart = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'workflow',
+      arguments: { preset: 'smoke-apply-preset' },
+    }, { id: 'workflow-apply-start' });
+    assert(applyWorkflowStart.status === 200, `apply workflow start failed with ${applyWorkflowStart.status}`);
+    const applyWorkflowStartJson = JSON.parse(applyWorkflowStart.body?.result?.content?.[0]?.text || '{}');
+    const applyJobId = applyWorkflowStartJson.jobId;
+    assert(applyJobId, 'apply workflow job id missing');
+
+    let applyWorkflowStatus = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'workflow_status',
+        arguments: { jobId: applyJobId },
+      }, { id: `workflow-apply-status-${i}` });
+      assert(statusRes.status === 200, `workflow_status for apply job failed with ${statusRes.status}`);
+      applyWorkflowStatus = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (applyWorkflowStatus.status && applyWorkflowStatus.status !== 'running' && applyWorkflowStatus.status !== 'queued') {
+        break;
+      }
+      await sleep(250);
+    }
+    assert(applyWorkflowStatus && applyWorkflowStatus.status === 'completed', `apply workflow did not complete: ${JSON.stringify(applyWorkflowStatus)}`);
+
+    const applySignal = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'signal',
+      arguments: { jobId: applyJobId },
+    }, { id: 'workflow-apply-signal' });
+    assert(applySignal.status === 200, `apply workflow signal failed with ${applySignal.status}`);
+    const applySignalJson = JSON.parse(applySignal.body?.result?.content?.[0]?.text || '{}');
+    assert((applySignalJson.filesTouched || []).some((entry) => String(entry).includes('hello.txt')), 'apply_patch filesTouched missing hello.txt');
+    assert(applySignalJson.rewind && applySignalJson.rewind.traceRef, 'workflow signal missing rewind refs');
+    assert(typeof applySignalJson.stats?.estimatedReductionPct === 'number', 'workflow signal missing reduction metrics');
+
+    const cargoJob = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'bash',
+      arguments: {
+        command: [
+          'echo cargo test smoke',
+          'printf "warning: simulated\\n"',
+          'printf "test result: ok\\n"',
+        ].join('; '),
+        cwd: '.',
+        description: 'cargo test smoke',
+      },
+    }, { id: 'cargo-job' });
+    assert(cargoJob.status === 200, `cargo bash failed with ${cargoJob.status}`);
+    const cargoJobJson = JSON.parse(cargoJob.body?.result?.content?.[0]?.text || '{}');
+    const cargoJobId = cargoJobJson.jobId;
+    assert(cargoJobId, 'cargo job id missing');
+
+    let cargoSignal = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'signal',
+        arguments: { jobId: cargoJobId },
+      }, { id: `cargo-signal-${i}` });
+      assert(statusRes.status === 200, `cargo signal failed with ${statusRes.status}`);
+      cargoSignal = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (cargoSignal.status && cargoSignal.status !== 'running' && cargoSignal.status !== 'queued') {
+        break;
+      }
+      await sleep(150);
+    }
+    assert(cargoSignal && cargoSignal.distiller === 'cargo', `cargo distiller mismatch: ${cargoSignal?.distiller}`);
+    assert(cargoSignal.rewind && cargoSignal.rewind.stdoutRef, 'cargo signal missing rewind refs');
+    assert(typeof cargoSignal.stats?.estimatedReductionPct === 'number', 'cargo signal missing reduction metrics');
+
+    const cargoRetrieve = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'job_retrieve',
+      arguments: {
+        ref: cargoSignal.rewind.stdoutRef,
+        maxBytes: 20000,
+      },
+    }, { id: 'cargo-retrieve' });
+    assert(cargoRetrieve.status === 200, `job_retrieve failed with ${cargoRetrieve.status}`);
+    const cargoRetrieveJson = JSON.parse(cargoRetrieve.body?.result?.content?.[0]?.text || '{}');
+    assert(String(cargoRetrieveJson.content || '').includes('warning: simulated'), 'job_retrieve missing raw stdout');
+
+    const cargoDiff = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'signal_diff',
+      arguments: { jobId: cargoJobId },
+    }, { id: 'cargo-diff' });
+    assert(cargoDiff.status === 200, `signal_diff failed with ${cargoDiff.status}`);
+    const cargoDiffJson = JSON.parse(cargoDiff.body?.result?.content?.[0]?.text || '{}');
+    assert(String(cargoDiffJson.rawPreview || '').includes('cargo test smoke'), 'signal_diff missing raw preview');
+    assert(String(cargoDiffJson.signalPreview || '').includes('headline'), 'signal_diff missing signal preview');
+    assert(Array.isArray(cargoDiffJson.removedPatterns), 'signal_diff missing removedPatterns');
+    assert(typeof cargoDiffJson.reductionPct === 'number', 'signal_diff missing reductionPct');
+
+    const workflowRejected = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'workflow',
+      arguments: {
+        steps: [
+          {
+            tool: 'bash',
+            arguments: {
+              command: 'printf should-not-run',
+              cwd: '.',
+              description: 'blocked bash step',
+            },
+          },
+        ],
+      },
+    }, { id: 'workflow-reject' });
+    assert(workflowRejected.status === 200, `workflow rejection call failed with ${workflowRejected.status}`);
+    const workflowRejectedJson = JSON.parse(workflowRejected.body?.result?.content?.[0]?.text || '{}');
+    assert(workflowRejectedJson.kind === 'workflow_preflight_error', `workflow rejection kind mismatch: ${workflowRejectedJson.kind}`);
+    assert(workflowRejectedJson.status === 'rejected', `workflow rejection status mismatch: ${workflowRejectedJson.status}`);
+    assert(Array.isArray(workflowRejectedJson.errors) && workflowRejectedJson.errors.some((entry) => String(entry).includes('bash')), 'workflow rejection errors missing bash');
 
     const oversizedBody = await fetch(baseUrl, {
       method: 'POST',

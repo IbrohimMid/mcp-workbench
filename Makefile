@@ -1,4 +1,4 @@
-.PHONY: up server tunnel install-systemd smoke-test doctor lint-security
+.PHONY: up server tunnel install-systemd smoke-test doctor lint-security verify worker-generate worker-up worker-doctor worker-install-systemd worker-list
 
 up:
 	./scripts/up.sh
@@ -12,6 +12,21 @@ tunnel:
 install-systemd:
 	./scripts/install-systemd.sh
 
+worker-generate:
+	node ./scripts/generate-worker.mjs $(ARGS)
+
+worker-up:
+	./scripts/worker-up.sh "$(WORKER)"
+
+worker-doctor:
+	./scripts/worker-doctor.sh "$(WORKER)"
+
+worker-install-systemd:
+	./scripts/worker-install-systemd.sh "$(WORKER)"
+
+worker-list:
+	./scripts/worker-list.sh
+
 smoke-test:
 	node ./scripts/smoke-test.mjs
 
@@ -20,3 +35,13 @@ doctor:
 
 lint-security:
 	node ./scripts/security-check.mjs
+
+verify:
+	node --check server/workbench-server.mjs
+	node --check scripts/smoke-test.mjs
+	node --check scripts/doctor.mjs
+	node --check scripts/security-check.mjs
+	node --check scripts/generate-worker.mjs
+	bash -n scripts/*.sh
+	node ./scripts/security-check.mjs
+	node ./scripts/smoke-test.mjs
