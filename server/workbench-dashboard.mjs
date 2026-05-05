@@ -111,7 +111,7 @@ function renderSignal(signal) {
   return lines.join('');
 }
 
-export function renderDashboardPage(state) {
+export function renderDashboardPage(state, options = {}) {
   const serializedState = serializeDashboardState(state);
   const workers = renderWorkerList(state.workers || []);
   const jobs = renderJobList(state.jobs || []);
@@ -119,6 +119,9 @@ export function renderDashboardPage(state) {
   const connection = state.connection || {};
   const tunnel = state.tunnel || {};
   const signal = state.selectedSignal || null;
+  const workspaceInfo = state.workspaceInfo || {};
+  const actionToken = String(options.actionToken || '');
+  const localOnly = !!actionToken && options.localOnly !== false;
 
   return `<!doctype html>
 <html lang="en">
@@ -126,6 +129,7 @@ export function renderDashboardPage(state) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>mcp-workbench dashboard</title>
+  <meta name="mcp-dashboard-action-token" content="${escapeHtml(actionToken)}" />
   <style>
     :root {
       color-scheme: dark;
@@ -207,6 +211,10 @@ export function renderDashboardPage(state) {
       border-radius: 12px; padding: 9px 12px; cursor: pointer; font: inherit;
     }
     .btn:hover { border-color: #3a4760; background: rgba(255,255,255,.07); }
+    .btn:disabled {
+      opacity: .55;
+      cursor: not-allowed;
+    }
     .list { display: grid; gap: 10px; }
     .worker-row, .job-row {
       width: 100%; display: flex; justify-content: space-between; gap: 14px; align-items: center;
@@ -223,12 +231,38 @@ export function renderDashboardPage(state) {
     h4 { margin: 16px 0 8px; font-size: 13px; letter-spacing: .02em; color: var(--soft); }
     .timeline { max-height: 620px; overflow: auto; }
     .signal pre { max-height: 220px; }
+    .tunnel-log pre { max-height: 220px; }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .form-grid label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .form-grid label.wide { grid-column: 1 / -1; }
+    .form-grid input,
+    .form-grid select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+      padding: 9px 10px;
+      font: inherit;
+    }
+    .action-row { margin-top: 14px; }
     .footer {
       margin-top: 16px; color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
     }
     @media (max-width: 980px) {
       .grid { grid-template-columns: 1fr; }
       .hero { flex-direction: column; align-items: flex-start; }
+      .form-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -246,8 +280,9 @@ export function renderDashboardPage(state) {
         </div>
       </div>
       <div class="copy-row">
-        <button class="btn" data-copy="${escapeHtml(connection.mcpUrl || '')}">Copy MCP URL</button>
-        <button class="btn" data-copy="${escapeHtml(connection.authHeader || '')}">Copy auth</button>
+        <button class="btn" id="copy-public-connector-url" data-copy="${escapeHtml(connection.publicConnectorUrl || '')}" ${connection.publicConnectorUrl ? '' : 'disabled'}>Copy public connector URL</button>
+        <button class="btn" id="copy-local-mcp-url" data-copy="${escapeHtml(connection.mcpUrl || '')}" ${connection.mcpUrl ? '' : 'disabled'}>Copy local MCP URL</button>
+        <button class="btn" id="copy-auth" ${localOnly && current.authMode !== 'no-auth' ? '' : 'disabled'}>Copy auth</button>
         <button class="btn" data-copy="${escapeHtml(connection.dashboardUrl || '')}">Copy dashboard URL</button>
       </div>
     </section>
@@ -264,7 +299,12 @@ export function renderDashboardPage(state) {
               <div class="kv-row"><strong>Name</strong><span>${escapeHtml(current.name || 'unknown')}</span></div>
               <div class="kv-row"><strong>Client</strong><span>${escapeHtml(current.client || 'unknown')}</span></div>
               <div class="kv-row"><strong>Workspace</strong><span>${escapeHtml(current.workspace || '')}</span></div>
+              <div class="kv-row"><strong>Repo root</strong><span>${escapeHtml(workspaceInfo.workspace?.root || '')}</span></div>
+              <div class="kv-row"><strong>Env file</strong><span>${escapeHtml(current.filePath || workspaceInfo.worker?.filePath || '')}</span></div>
+              <div class="kv-row"><strong>Runtime</strong><span>${escapeHtml(workspaceInfo.workspace?.runtimeRoot || '')}</span></div>
               <div class="kv-row"><strong>Permission</strong><span>${badge(current.permissionLabel || 'readonly', current.permissionLabel || '')}</span></div>
+              <div class="kv-row"><strong>Auth</strong><span>${badge(current.authMode || 'bearer', current.authMode || '')}</span></div>
+              <div class="kv-row"><strong>Boundary</strong><span>${escapeHtml(workspaceInfo.boundary?.allowOutside ? 'outside workspace allowed' : 'workspace-bound')}</span></div>
               <div class="kv-row"><strong>Port</strong><span>${escapeHtml(String(current.port || ''))}</span></div>
             </div>
           </div>
@@ -278,14 +318,73 @@ export function renderDashboardPage(state) {
           <div class="body">
             <div class="kv">
               <div class="kv-row"><strong>MCP URL</strong><span>${escapeHtml(connection.mcpUrl || '')}</span></div>
+              <div class="kv-row"><strong>Public connector URL</strong><span>${escapeHtml(connection.publicConnectorUrl || 'waiting for tunnel URL')}</span></div>
               <div class="kv-row"><strong>Dashboard URL</strong><span>${escapeHtml(connection.dashboardUrl || '')}</span></div>
               <div class="kv-row"><strong>Tunnel URL</strong><span>${escapeHtml(tunnel.tunnelUrl || 'not configured')}</span></div>
+              <div class="kv-row"><strong>Tunnel public URL</strong><span>${escapeHtml(tunnel.publicUrl || 'waiting for tunnel URL')}</span></div>
               <div class="kv-row"><strong>Auth hint</strong><span>${escapeHtml(connection.authHint || '')}</span></div>
             </div>
             <div class="footer">
               <span>${escapeHtml(tunnel.modeLabel || 'quick tunnel ready')}</span>
-              <span>${escapeHtml(tunnel.hint || 'Use the browser to copy the final URL or auth header into ChatGPT / Notion.')}</span>
+              <span>${escapeHtml(tunnel.hint || 'Use the browser to copy the public connector URL or auth header into ChatGPT / Notion.')}</span>
             </div>
+            <div class="tunnel-log">
+              <h4>Tunnel log tail</h4>
+              <pre id="tunnel-log-tail">${escapeHtml(tunnel.logTail || 'waiting for tunnel log...')}</pre>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="head">
+            <h2>Control panel</h2>
+            <span class="badge">${escapeHtml(localOnly ? 'local-only' : 'view-only')}</span>
+          </div>
+          <div class="body">
+            <p class="muted">Mutating actions stay local and require the dashboard action token.</p>
+            <div class="form-grid">
+              <label>
+                <span>Worker name</span>
+                <input id="worker-name" value="${escapeHtml(current.name || 'chatgpt')}" />
+              </label>
+              <label>
+                <span>Client</span>
+                <input id="worker-client" value="${escapeHtml(current.client || 'chatgpt')}" />
+              </label>
+              <label class="wide">
+                <span>Workspace</span>
+                <input id="worker-workspace" value="${escapeHtml(current.workspace || workspaceInfo.worker?.workspace || '')}" />
+              </label>
+              <label>
+                <span>Permission</span>
+                <select id="worker-permission">
+                  ${['readonly', 'standard', 'yolo'].map((value) => `<option value="${value}"${value === (current.permissionLabel || 'readonly') ? ' selected' : ''}>${value}</option>`).join('')}
+                </select>
+              </label>
+              <label>
+                <span>Port</span>
+                <input id="worker-port" type="number" min="1" step="1" value="${escapeHtml(String(current.port || 3333))}" />
+              </label>
+              <label>
+                <span>Tunnel</span>
+                <select id="worker-tunnel">
+                  ${['quick', 'named'].map((value) => `<option value="${value}"${value === (current.tunnelMode || 'quick') ? ' selected' : ''}>${value}</option>`).join('')}
+                </select>
+              </label>
+            </div>
+            <div class="copy-row action-row">
+              <button class="btn" id="create-worker" ${localOnly ? '' : 'disabled'}>Create worker</button>
+              <button class="btn" data-worker-action="server/start" ${localOnly ? '' : 'disabled'}>Start server</button>
+              <button class="btn" data-worker-action="server/stop" ${localOnly ? '' : 'disabled'}>Stop server</button>
+              <button class="btn" data-worker-action="server/restart" ${localOnly ? '' : 'disabled'}>Restart server</button>
+              <button class="btn" data-worker-action="tunnel/start" ${localOnly ? '' : 'disabled'}>Start tunnel</button>
+              <button class="btn" data-worker-action="tunnel/stop" ${localOnly ? '' : 'disabled'}>Stop tunnel</button>
+              <button class="btn" data-worker-action="tunnel/restart" ${localOnly ? '' : 'disabled'}>Restart tunnel</button>
+              <button class="btn" data-worker-action="doctor" ${localOnly ? '' : 'disabled'}>Run doctor</button>
+              <button class="btn" data-worker-action="validate" ${localOnly ? '' : 'disabled'}>Validate config</button>
+            </div>
+            <p class="muted" id="action-status">${escapeHtml(localOnly ? 'Ready.' : 'Actions are disabled for non-local dashboard access.')}</p>
+            <p class="muted">Target worker: <strong>${escapeHtml(current.name || 'unknown')}</strong>. Actions affect the selected worker profile.</p>
           </div>
         </article>
 
@@ -328,6 +427,8 @@ export function renderDashboardPage(state) {
     let currentState = initialState;
     let selectedWorker = (initialState.current && initialState.current.name) || null;
     let selectedJob = initialState.selectedJobId || (initialState.jobs && initialState.jobs[0] && initialState.jobs[0].jobId) || null;
+    const dashboardActionToken = (document.querySelector('meta[name="mcp-dashboard-action-token"]') || {}).content || '';
+    const localActionsEnabled = !!dashboardActionToken;
 
     function escapeHtml(value) {
       return String(value ?? '')
@@ -343,10 +444,174 @@ export function renderDashboardPage(state) {
       await navigator.clipboard.writeText(text);
     }
 
-    async function fetchJson(path) {
-      const response = await fetch(path, { headers: { accept: 'application/json' } });
+    async function fetchJson(path, init = {}) {
+      const response = await fetch(path, {
+        ...init,
+        headers: {
+          accept: 'application/json',
+          ...(init.headers || {}),
+        },
+      });
       if (!response.ok) throw new Error(path + ' -> ' + response.status);
       return response.json();
+    }
+
+    async function postJson(path, body = {}) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          ...(dashboardActionToken ? { 'x-mcp-dashboard-token': dashboardActionToken } : {}),
+        },
+        body: JSON.stringify(body || {}),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || (path + ' -> ' + response.status));
+      }
+      return payload;
+    }
+
+    function setActionStatus(message) {
+      const el = document.getElementById('action-status');
+      if (el) el.textContent = message || '';
+    }
+
+    function selectedWorkerName() {
+      return (currentState.current && currentState.current.name) || selectedWorker || '';
+    }
+
+    function syncAuthButtonState() {
+      const button = document.getElementById('copy-auth');
+      if (!button) return;
+      button.disabled = !localActionsEnabled || !selectedWorkerName() || (currentState.current && currentState.current.authMode === 'no-auth');
+    }
+
+    function syncConnectionButtons() {
+      const publicButton = document.getElementById('copy-public-connector-url');
+      if (publicButton) {
+        const publicUrl = currentState.connection && currentState.connection.publicConnectorUrl ? String(currentState.connection.publicConnectorUrl) : '';
+        publicButton.disabled = !publicUrl;
+        publicButton.dataset.copy = publicUrl;
+      }
+      const localButton = document.getElementById('copy-local-mcp-url');
+      if (localButton) {
+        const localUrl = currentState.connection && currentState.connection.mcpUrl ? String(currentState.connection.mcpUrl) : '';
+        localButton.disabled = !localUrl;
+        localButton.dataset.copy = localUrl;
+      }
+      const dashboardButton = document.querySelector('button[data-copy="' + escapeHtml(currentState.connection && currentState.connection.dashboardUrl ? String(currentState.connection.dashboardUrl) : '') + '"]');
+      if (dashboardButton && currentState.connection && currentState.connection.dashboardUrl) {
+        dashboardButton.dataset.copy = String(currentState.connection.dashboardUrl);
+      }
+    }
+
+    function syncTunnelPanel() {
+      const tunnelLog = document.getElementById('tunnel-log-tail');
+      if (tunnelLog) {
+        const tail = currentState.tunnel && currentState.tunnel.logTail ? String(currentState.tunnel.logTail) : 'waiting for tunnel log...';
+        tunnelLog.textContent = tail;
+      }
+    }
+
+    async function copySelectedAuth() {
+      const name = selectedWorkerName();
+      if (!name) throw new Error('no worker selected');
+      const payload = await fetchJson('/api/workers/' + encodeURIComponent(name) + '/auth-header', {
+        headers: {
+          ...(dashboardActionToken ? { 'x-mcp-dashboard-token': dashboardActionToken } : {}),
+        },
+      });
+      if (payload.authMode === 'no-auth') {
+        throw new Error('no auth required for selected worker');
+      }
+      await copyText(payload.authHeader || '');
+      return payload;
+    }
+
+    async function runWorkerAction(action) {
+      const name = selectedWorkerName();
+      if (!name) throw new Error('no worker selected');
+      const response = await postJson('/api/workers/' + encodeURIComponent(name) + '/' + action);
+      await refresh();
+      return response;
+    }
+
+    async function refreshUntilConnectorReady(timeoutMs = 15000, intervalMs = 1000) {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt <= timeoutMs) {
+        await refresh();
+        if (currentState.connection && currentState.connection.publicConnectorUrl) {
+          return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+      return false;
+    }
+
+    async function createWorkerFromForm() {
+      const payload = {
+        name: document.getElementById('worker-name').value.trim(),
+        client: document.getElementById('worker-client').value.trim(),
+        workspace: document.getElementById('worker-workspace').value.trim(),
+        permission: document.getElementById('worker-permission').value,
+        port: Number(document.getElementById('worker-port').value),
+        tunnelMode: document.getElementById('worker-tunnel').value,
+      };
+      const response = await postJson('/api/workers/create', payload);
+      await refresh();
+      return response;
+    }
+
+    if (localActionsEnabled) {
+      const createButton = document.getElementById('create-worker');
+      if (createButton) {
+        createButton.addEventListener('click', async () => {
+          try {
+            setActionStatus('Creating worker...');
+            await createWorkerFromForm();
+            setActionStatus('Worker created.');
+          } catch (error) {
+            setActionStatus(String(error && error.message ? error.message : error));
+          }
+        });
+      }
+
+      document.querySelectorAll('[data-worker-action]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const action = button.getAttribute('data-worker-action');
+          try {
+            setActionStatus(action.replace('/', ' ') + '...');
+            await runWorkerAction(action);
+            if (action === 'tunnel/start' || action === 'tunnel/restart') {
+              setActionStatus('Waiting for public connector URL...');
+              const ready = await refreshUntilConnectorReady();
+              setActionStatus(ready ? 'Public connector URL ready.' : 'Tunnel started, waiting for Cloudflare URL...');
+            }
+            setActionStatus(action.replace('/', ' ') + ' complete.');
+          } catch (error) {
+            setActionStatus(String(error && error.message ? error.message : error));
+          }
+        });
+      });
+
+      const copyAuthButton = document.getElementById('copy-auth');
+      if (copyAuthButton) {
+        copyAuthButton.addEventListener('click', async () => {
+          try {
+            setActionStatus('Copying auth...');
+            await copySelectedAuth();
+            copyAuthButton.textContent = 'Copied';
+            setTimeout(() => {
+              copyAuthButton.textContent = 'Copy auth';
+            }, 1000);
+            setActionStatus('Auth copied.');
+          } catch (error) {
+            setActionStatus(String(error && error.message ? error.message : error));
+          }
+        });
+      }
     }
 
     function renderWorkers(workers) {
@@ -438,6 +703,9 @@ export function renderDashboardPage(state) {
         '<span class="chip">' + escapeHtml(state.current.authMode || 'bearer') + '</span>',
         '<span class="chip">' + escapeHtml(state.server.name || 'mcp-workbench') + '</span>'
       ].join('');
+      syncConnectionButtons();
+      syncTunnelPanel();
+      syncAuthButtonState();
     }
 
     document.querySelectorAll('[data-copy]').forEach((button) => {
@@ -458,6 +726,9 @@ export function renderDashboardPage(state) {
     renderWorkers(currentState.workers || []);
     renderJobs(currentState.jobs || []);
     renderSignal(currentState.selectedSignal || null);
+    syncConnectionButtons();
+    syncTunnelPanel();
+    syncAuthButtonState();
   </script>
 </body>
 </html>`;

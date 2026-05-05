@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { renderDashboardPage } from './workbench-dashboard.mjs';
 
@@ -38,10 +38,13 @@ const workflowPresetsRoot = path.resolve(process.env.MCP_WORKFLOW_PRESET_DIR || 
 const workspaceSignalFiltersRoot = path.resolve(process.env.MCP_SIGNAL_FILTER_DIR || path.join(root, '.mcp-workbench', 'signal-filters'));
 const builtinSignalFiltersRoot = path.join(repoRoot, 'signal-filters');
 const trustedSignalRegistryPath = path.resolve(process.env.MCP_SIGNAL_TRUST_REGISTRY || path.join(os.homedir(), '.config', 'mcp-workbench', 'trusted-workspaces.json'));
+const runtimeRoot = path.resolve(root, '.mcp-workbench', 'runtime');
+const workerRuntimeRoot = path.join(runtimeRoot, 'workers');
 const pollIntervalMs = Math.max(250, Number(process.env.MCP_WORKFLOW_POLL_INTERVAL_MS || 1000));
 const jobRetentionHours = Math.max(0, Number(process.env.MCP_JOB_RETENTION_HOURS || 24));
 const jobMaxCount = Math.max(0, Number(process.env.MCP_JOB_MAX_COUNT || 200));
 const jobCleanupIntervalMs = Math.max(60_000, Number(process.env.MCP_JOB_CLEANUP_INTERVAL_MS || 3_600_000));
+const dashboardActionToken = crypto.randomBytes(24).toString('hex');
 
 const sessions = new Map();
 const sessionsByWorker = new Map();
@@ -65,6 +68,8 @@ await ensureWorkspaceRoot();
 const realRoot = await fsp.realpath(root);
 await ensureDir(jobsRoot);
 await ensureDir(workflowPresetsRoot);
+await ensureDir(runtimeRoot);
+await ensureDir(workerRuntimeRoot);
 const realJobsRoot = await fsp.realpath(jobsRoot);
 const realWorkflowPresetsRoot = await fsp.realpath(workflowPresetsRoot);
 if (!allowOutside) {
@@ -141,17 +146,25 @@ function buildCorsHeaders(req) {
   return {};
 }
 
-function isLocalDashboardRequest(req) {
-  const hostHeader = String(req.headers.host || '').trim().toLowerCase();
-  return (
-    hostHeader.startsWith('localhost') ||
-    hostHeader.startsWith('127.0.0.1') ||
-    hostHeader.startsWith('[::1]') ||
-    hostHeader === '::1'
-  );
+function isLoopbackHost(host) {
+  const value = String(host || '').trim().toLowerCase();
+  return value.startsWith('localhost') || value.startsWith('127.0.0.1') || value.startsWith('[::1]') || value === '::1';
 }
 
-function applyCorsHeaders(req, res) {
+function isLocalDashboardRequest(req) {
+  const hostHeader = String(req.headers.host || '').trim().toLowerCase();
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').trim().toLowerCase();
+  const forwardedFor = String(req.headers['x-forwarded-for'] || '').trim();
+  if (forwardedFor) return false;
+  if (forwardedHost && !isLoopbackHost(forwardedHost)) return false;
+  return isLoopbackHost(hostHeader);
+}
+
+function applyCorsHeaders(req, res, urlObj = null) {
+  const pathname = String(urlObj?.pathname || '');
+  if (pathname === '/dashboard' || pathname.startsWith('/api/')) {
+    return;
+  }
   for (const [key, value] of Object.entries(buildCorsHeaders(req))) {
     res.setHeader(key, value);
   }
@@ -414,6 +427,124 @@ async function readJsonIfExists(filePath) {
   } catch {
     return {};
   }
+}
+
+function safeWorkerName(name) {
+  const value = String(name || '').trim();
+  if (!value) {
+    throw new Error('worker name is required');
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error(`invalid worker name: ${name}`);
+  }
+  return value;
+}
+
+function workerRuntimeDir(name) {
+  return path.join(workerRuntimeRoot, safeWorkerName(name));
+}
+
+function workerRuntimeStatePath(name) {
+  return path.join(workerRuntimeDir(name), 'state.json');
+}
+
+function workerRuntimePidPath(name, component) {
+  return path.join(workerRuntimeDir(name), `${component}.pid`);
+}
+
+function workerRuntimeLogPath(name, component) {
+  return path.join(workerRuntimeDir(name), `${component}.log`);
+}
+
+function extractTryCloudflareUrl(text) {
+  const matches = String(text || '').match(/https:\/\/[A-Za-z0-9-]+\.trycloudflare\.com/gi);
+  return matches && matches.length ? matches[matches.length - 1] : '';
+}
+
+async function readWorkerRuntimeState(name) {
+  const state = await readJsonIfExists(workerRuntimeStatePath(name));
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return null;
+  return state;
+}
+
+async function writeWorkerRuntimeState(name, state) {
+  await ensureDir(workerRuntimeDir(name));
+  await fsp.writeFile(workerRuntimeStatePath(name), JSON.stringify(state, null, 2), 'utf8');
+}
+
+function isPidAlive(pid) {
+  const value = Number(pid);
+  if (!Number.isFinite(value) || value <= 0) return false;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function snapshotWorkerRuntime(name) {
+  let state = await readWorkerRuntimeState(name);
+  const serverPid = Number(state?.server?.pid || 0) || 0;
+  const tunnelPid = Number(state?.tunnel?.pid || 0) || 0;
+  const serverRunning = isPidAlive(serverPid);
+  const tunnelRunning = isPidAlive(tunnelPid);
+
+  const tunnelLog = await readTextIfExists(workerRuntimeLogPath(name, 'tunnel'));
+  const tunnelPublicUrl = extractTryCloudflareUrl(tunnelLog);
+  const tunnelLogTail = redactSecrets(await readTail(workerRuntimeLogPath(name, 'tunnel'), 80).catch(() => ''));
+  if (tunnelPublicUrl) {
+    const currentPublicUrl = String(state?.tunnel?.publicUrl || '').trim();
+    if (currentPublicUrl !== tunnelPublicUrl) {
+      state = {
+        ...(state || {}),
+        tunnel: {
+          ...(state?.tunnel || {}),
+          publicUrl: tunnelPublicUrl,
+          publicConnectorUrl: `${tunnelPublicUrl.replace(/\/$/, '')}/mcp`,
+          publicUrlDetectedAt: nowIso(),
+        },
+      };
+      await writeWorkerRuntimeState(name, state).catch(() => {});
+    }
+  }
+
+  return {
+    ...(state || {}),
+    server: state?.server ? {
+      ...state.server,
+      pid: serverPid || null,
+      running: serverRunning,
+      pidPath: safeSignalPath(workerRuntimePidPath(name, 'server')),
+      logPath: safeSignalPath(workerRuntimeLogPath(name, 'server')),
+    } : null,
+    tunnel: state?.tunnel ? {
+      ...state.tunnel,
+      pid: tunnelPid || null,
+      running: tunnelRunning,
+      pidPath: safeSignalPath(workerRuntimePidPath(name, 'tunnel')),
+      logPath: safeSignalPath(workerRuntimeLogPath(name, 'tunnel')),
+      logTail: tunnelLogTail,
+      publicConnectorUrl: state?.tunnel?.publicConnectorUrl || (state?.tunnel?.publicUrl ? `${String(state.tunnel.publicUrl).replace(/\/$/, '')}/mcp` : ''),
+    } : null,
+    running: serverRunning || tunnelRunning,
+  };
+}
+
+function cleanSpawnEnv(overrides = {}) {
+  const base = {
+    HOME: process.env.HOME,
+    USER: process.env.USER,
+    PATH: process.env.PATH,
+    TMPDIR: process.env.TMPDIR,
+    LANG: process.env.LANG,
+    LC_ALL: process.env.LC_ALL,
+    TERM: process.env.TERM,
+  };
+  for (const [key, value] of Object.entries(overrides || {})) {
+    if (value !== undefined && value !== null) base[key] = String(value);
+  }
+  return base;
 }
 
 function readPatternList(value) {
@@ -1027,7 +1158,7 @@ function workflowToolCategory(name) {
   if (['write', 'edit', 'apply_patch'].includes(name)) return 'filesystem-write';
   if (['bash', 'bash_status', 'bash_tail', 'bash_result', 'bash_kill'].includes(name)) return 'shell';
   if (name === 'webfetch') return 'network';
-  if (['job_retrieve', 'signal_diff', 'signal_filters'].includes(name)) return 'workflow-read';
+  if (['job_retrieve', 'signal_diff', 'signal_filters', 'workspace_info'].includes(name)) return 'workflow-read';
   if (name === 'trust_workspace_filters') return 'workflow-control';
   if (['workflow', 'workflow_cancel'].includes(name)) return 'workflow-control';
   if (['workflow_presets', 'workflow_status', 'workflow_result', 'signal'].includes(name)) return 'workflow-read';
@@ -1055,7 +1186,7 @@ function workflowStepAllowed(step, permissions) {
 }
 
 function isToolEnabled(name) {
-  if (['read', 'glob', 'grep', 'codesearch', 'lsp', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result', 'job_retrieve', 'signal_diff', 'signal_filters', 'trust_workspace_filters'].includes(name)) {
+  if (['read', 'glob', 'grep', 'codesearch', 'lsp', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result', 'job_retrieve', 'signal_diff', 'signal_filters', 'workspace_info', 'trust_workspace_filters'].includes(name)) {
     return true;
   }
   if (['write', 'edit', 'apply_patch'].includes(name)) return enableWriteTools;
@@ -1226,7 +1357,7 @@ function globToRegExp(pattern) {
 }
 
 function getToolAnnotations(name) {
-  const readOnly = ['read', 'glob', 'grep', 'webfetch', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result', 'job_retrieve', 'signal_diff', 'signal_filters'];
+  const readOnly = ['read', 'glob', 'grep', 'webfetch', 'workflow_presets', 'signal', 'workflow_status', 'workflow_result', 'job_retrieve', 'signal_diff', 'signal_filters', 'workspace_info'];
   const writeTools = ['write', 'edit', 'apply_patch', 'bash', 'bash_status', 'bash_tail', 'bash_result', 'bash_kill', 'workflow', 'workflow_cancel'];
   const configTools = ['trust_workspace_filters'];
 
@@ -1461,6 +1592,11 @@ const TOOLS = [
     additionalProperties: false,
   }),
   baseTool('trust_workspace_filters', 'Trust local workspace signal filters for the current workspace.', {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  }),
+  baseTool('workspace_info', 'Return the active worker, workspace boundary, runtime, and connector details.', {
     type: 'object',
     properties: {},
     additionalProperties: false,
@@ -1850,6 +1986,8 @@ async function runTool(name, args, ctx = {}) {
       return handleSignalFilters(args);
     case 'trust_workspace_filters':
       return handleTrustWorkspaceFilters(args);
+    case 'workspace_info':
+      return handleWorkspaceInfo(args);
     case 'workflow':
       return handleWorkflow(args, ctx);
     case 'workflow_status':
@@ -2544,6 +2682,14 @@ async function handleTrustWorkspaceFilters() {
   };
 }
 
+async function handleWorkspaceInfo() {
+  const summary = summarizeWorkerEnv(process.env, process.env.WORKBENCH_ENV_FILE || path.join(root, '.env'));
+  const runtime = await snapshotWorkerRuntime(summary.name);
+  return {
+    content: okContent(JSON.stringify(buildWorkspaceInfoFromSummary(summary, runtime, { includeSecrets: false }), null, 2)),
+  };
+}
+
 async function waitForBashJob(jobId, timeoutMs = 0) {
   const started = Date.now();
   for (;;) {
@@ -2890,6 +3036,7 @@ async function readEnvFile(filePath) {
 async function listWorkerEnvFiles() {
   const discovered = new Map();
   const directories = [
+    path.join(repoRoot, '.mcp-workbench', 'workers'),
     path.join(root, '.mcp-workbench', 'workers'),
     path.join(os.homedir(), '.config', 'mcp-workbench', 'workers'),
   ];
@@ -2976,6 +3123,90 @@ function summarizeWorkerEnv(env, filePath = '') {
   };
 }
 
+function buildWorkspaceInfoFromSummary(summary, runtime = null, options = {}) {
+  const includeSecrets = !!options.includeSecrets;
+  const authRequired = summary.authMode !== 'no-auth';
+  const authHeader = authRequired
+    ? (includeSecrets ? summary.authHeader : 'Authorization: Bearer [REDACTED]')
+    : '';
+  const authHint = authRequired
+    ? (includeSecrets ? summary.authHint : 'Authorization: Bearer [REDACTED]')
+    : 'No auth required';
+
+  return {
+    ok: true,
+    worker: {
+      name: summary.name,
+      client: summary.client,
+      permissionLabel: summary.permissionLabel,
+      status: summary.status,
+      workspace: summary.workspace,
+      filePath: summary.filePath,
+      host: summary.host,
+      port: summary.port,
+      dashboardPort: Number(summary.env?.MCP_DASHBOARD_PORT || summary.port) || summary.port,
+      mcpUrl: summary.mcpUrl,
+      dashboardUrl: summary.dashboardUrl,
+      tunnelMode: summary.tunnelMode,
+      tunnelUrl: summary.tunnelUrl,
+      authMode: summary.authMode,
+      authHeader,
+      authHint,
+      tokenPresent: summary.tokenPresent,
+      jobDir: summary.jobDir,
+      workflowPresetDir: summary.workflowPresetDir,
+      signalFilterDir: summary.signalFilterDir,
+    },
+    workspace: {
+      root,
+      realRoot,
+      repoRoot,
+      allowOutside,
+      jobsRoot: realJobsRoot,
+      workflowPresetsRoot: realWorkflowPresetsRoot,
+      signalFiltersRoot: workspaceSignalFiltersRoot,
+      builtinSignalFiltersRoot,
+      runtimeRoot,
+      workerRuntimeRoot,
+      trustedSignalRegistryPath,
+      dashboardActionToken: includeSecrets ? dashboardActionToken : null,
+    },
+    connection: {
+      mcpUrl: summary.mcpUrl,
+      publicConnectorUrl: runtime?.tunnel?.publicConnectorUrl || runtime?.tunnel?.publicUrl
+        ? `${String(runtime?.tunnel?.publicConnectorUrl || runtime?.tunnel?.publicUrl).replace(/\/$/, '')}/mcp`
+        : '',
+      dashboardUrl: summary.dashboardUrl,
+      tunnelUrl: summary.tunnelUrl,
+      authMode: summary.authMode,
+      authHeader,
+      authHint,
+      queryTokenHint: envBoolValue(summary.env?.MCP_ALLOW_QUERY_TOKEN) ? 'query token enabled' : 'query token disabled',
+      noAuthHint: summary.authMode === 'no-auth' ? 'no auth enabled for local development' : 'auth required',
+    },
+    boundary: {
+      workspace: summary.workspace,
+      realWorkspace: realRoot,
+      allowOutside,
+      workspaceInsideBoundary: !allowOutside || summary.workspace === root,
+    },
+    toolGating: {
+      write: enableWriteTools,
+      bash: enableBash,
+      webfetch: enableWebfetch,
+      workflow: enableWorkflow,
+      sanitizeBashEnv,
+    },
+    runtime: runtime || null,
+    server: {
+      name: serverName,
+      version: serverVersion,
+      host,
+      port,
+    },
+  };
+}
+
 async function checkWorkerStatus(summary) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('health timeout')), 900);
@@ -3007,7 +3238,7 @@ function pickWorker(workers, workerName) {
     const found = workers.find((worker) => worker.name === currentName);
     if (found) return found;
   }
-  return workers[0] || summarizeWorkerEnv({
+  return summarizeWorkerEnv({
     MCP_SERVER_NAME: serverName,
     MCP_HOST: host,
     MCP_PORT: String(port),
@@ -3161,65 +3392,85 @@ async function getLocalJobSignal(job) {
   }
 }
 
-async function buildDashboardPayload(urlObj) {
+async function buildDashboardPayload(urlObj, options = {}) {
+  const exposeSecrets = !!options.exposeSecrets;
   const workerName = String(urlObj.searchParams.get('worker') || '').trim();
   const jobId = String(urlObj.searchParams.get('job') || '').trim();
   const workers = await discoverWorkers();
   const current = pickWorker(workers, workerName);
-  const jobs = await listJobsForWorker(current, 60);
+  const currentSummary = current.summary || current;
+  const currentRuntime = await snapshotWorkerRuntime(currentSummary.name);
+  const jobs = await listJobsForWorker(currentSummary, 60);
   const selectedJob = jobId || jobs.find((job) => job.status === 'running')?.jobId || jobs[0]?.jobId || null;
-  const selectedJobRecord = selectedJob ? loadJobFromDiskSync(selectedJob, path.resolve(current.jobDir || jobsRoot)) : null;
+  const selectedJobRecord = selectedJob ? loadJobFromDiskSync(selectedJob, path.resolve(currentSummary.jobDir || jobsRoot)) : null;
   const selectedSignal = selectedJobRecord ? await getLocalJobSignal(selectedJobRecord) : null;
-  const mcpUrl = current.mcpUrl;
-  const dashboardUrl = current.dashboardUrl;
-  const tunnelUrl = current.tunnelUrl ? `${current.tunnelUrl.replace(/\/$/, '')}/mcp` : '';
+  const currentPort = Number(currentSummary.port || port) || port;
+  const currentHost = String(currentSummary.host || host || '127.0.0.1').trim() || '127.0.0.1';
+  const mcpUrl = currentSummary.mcpUrl || `http://${currentHost}:${currentPort}/mcp`;
+  const dashboardUrl = currentSummary.dashboardUrl || `http://${currentHost}:${currentPort}/dashboard`;
+  const tunnelUrl = currentSummary.tunnelUrl ? `${currentSummary.tunnelUrl.replace(/\/$/, '')}/mcp` : '';
+  const workspaceInfo = buildWorkspaceInfoFromSummary(currentSummary, currentRuntime, { includeSecrets: exposeSecrets });
+  const { env: _env, ...currentWithoutEnv } = currentSummary;
+  const publicConnectorUrl = currentRuntime?.tunnel?.publicConnectorUrl
+    || (currentRuntime?.tunnel?.publicUrl ? `${String(currentRuntime.tunnel.publicUrl).replace(/\/$/, '')}/mcp` : '')
+    || '';
   return {
     ok: true,
-    server: {
-      name: serverName,
-      version: serverVersion,
-    },
+    server: workspaceInfo.server,
+    workspaceInfo,
     current: {
-      ...current,
+      ...currentWithoutEnv,
+      runtime: currentRuntime,
       mcpUrl,
+      publicConnectorUrl,
       dashboardUrl,
       tunnelUrl,
-      status: current.status || 'offline',
-      permissionLabel: current.permissionLabel,
-      authMode: current.authMode,
-      authHeader: current.authHeader,
-      authHint: current.authHint,
+      status: currentSummary.status || 'offline',
+      permissionLabel: currentSummary.permissionLabel,
+      authMode: currentSummary.authMode,
+      authHeader: exposeSecrets ? currentSummary.authHeader : (currentSummary.tokenPresent ? 'Authorization: Bearer [REDACTED]' : ''),
+      authHint: exposeSecrets ? currentSummary.authHint : (currentSummary.authMode === 'no-auth' ? 'No auth required' : 'Bearer token configured'),
     },
     connection: {
       mcpUrl,
+      publicConnectorUrl,
       dashboardUrl,
       tunnelUrl,
-      authMode: current.authMode,
-      authHeader: current.authHeader,
-      authHint: current.authHint,
+      authMode: currentSummary.authMode,
+      authHeader: exposeSecrets ? currentSummary.authHeader : (currentSummary.tokenPresent ? 'Authorization: Bearer [REDACTED]' : ''),
+      authHint: exposeSecrets ? currentSummary.authHint : (currentSummary.authMode === 'no-auth' ? 'No auth required' : 'Bearer token configured'),
       queryTokenHint: allowQueryToken ? 'query token enabled' : 'query token disabled',
       noAuthHint: allowNoAuth ? 'no auth enabled for local development' : 'auth required',
     },
     tunnel: {
-      mode: current.tunnelMode || 'quick',
-      modeLabel: current.tunnelMode === 'named' ? 'named tunnel' : 'quick tunnel',
-      hint: current.tunnelMode === 'named'
+      mode: currentSummary.tunnelMode || 'quick',
+      modeLabel: currentSummary.tunnelMode === 'named' ? 'named tunnel' : 'quick tunnel',
+      hint: currentSummary.tunnelMode === 'named'
         ? 'Named tunnel keeps the public URL stable.'
         : 'Quick tunnel is fine for development and testing.',
       configPath: String(process.env.CLOUDFLARED_CONFIG || '').trim(),
+      publicUrl: currentRuntime?.tunnel?.publicUrl || '',
+      publicConnectorUrl,
+      logTail: currentRuntime?.tunnel?.logTail || '',
     },
-    workers: workers.map((worker) => ({
-      name: worker.name,
-      client: worker.client,
-      permissionLabel: worker.permissionLabel,
-      status: worker.status,
-      workspace: worker.workspace,
-      port: worker.port,
-      host: worker.host,
-      dashboardUrl: worker.dashboardUrl,
-      mcpUrl: worker.mcpUrl,
-      tunnelMode: worker.tunnelMode,
-      isSelected: worker.name === current.name,
+    workers: await Promise.all(workers.map(async (worker) => {
+      const runtime = await snapshotWorkerRuntime(worker.name);
+      const workerSummary = worker.summary || worker;
+      return {
+        name: workerSummary.name,
+        client: workerSummary.client,
+        permissionLabel: workerSummary.permissionLabel,
+        status: worker.status,
+        workspace: workerSummary.workspace,
+        port: workerSummary.port,
+        host: workerSummary.host,
+        dashboardUrl: workerSummary.dashboardUrl,
+        mcpUrl: workerSummary.mcpUrl,
+        publicConnectorUrl: worker.runtime?.tunnel?.publicConnectorUrl || '',
+        tunnelMode: workerSummary.tunnelMode,
+        runtime,
+        isSelected: workerSummary.name === currentSummary.name,
+      };
     })),
     jobs: jobs.map((job) => ({
       ...job,
@@ -3240,16 +3491,17 @@ async function getDashboardJobDetail(urlObj, jobId) {
   const workerName = String(urlObj.searchParams.get('worker') || '').trim();
   const workers = await discoverWorkers();
   const current = pickWorker(workers, workerName);
-  const job = loadJobFromDiskSync(jobId, path.resolve(current.jobDir || jobsRoot));
+  const currentSummary = current.summary || current;
+  const job = loadJobFromDiskSync(jobId, path.resolve(currentSummary.jobDir || jobsRoot));
   const signal = job ? await getLocalJobSignal(job) : null;
   return {
     ok: true,
     worker: {
-      name: current.name,
-      client: current.client,
-      dashboardUrl: current.dashboardUrl,
-      mcpUrl: current.mcpUrl,
-      permissionLabel: current.permissionLabel,
+      name: currentSummary.name,
+      client: currentSummary.client,
+      dashboardUrl: currentSummary.dashboardUrl,
+      mcpUrl: currentSummary.mcpUrl,
+      permissionLabel: currentSummary.permissionLabel,
     },
     job: job ? {
       jobId: job.jobId,
@@ -3273,6 +3525,211 @@ async function getDashboardJobDetail(urlObj, jobId) {
       permissions: job.permissions,
     } : null,
     signal,
+  };
+}
+
+function isDashboardActionAuthorized(req) {
+  const token = String(req.headers['x-mcp-dashboard-token'] || '').trim();
+  return isLocalDashboardRequest(req) && token && token === dashboardActionToken;
+}
+
+async function findWorkerSummary(name) {
+  const target = safeWorkerName(name);
+  const workers = await listWorkerEnvFiles();
+  const worker = workers.find((entry) => entry.name === target);
+  if (!worker) {
+    throw new Error(`worker not found: ${target}`);
+  }
+  return worker.summary;
+}
+
+async function getWorkerSummaryByName(name) {
+  const target = safeWorkerName(name);
+  const workers = await listWorkerEnvFiles();
+  const worker = workers.find((entry) => entry.name === target);
+  if (worker) return worker.summary;
+  const runtimeState = await readWorkerRuntimeState(target);
+  const env = runtimeState?.server?.envFile
+    ? await readEnvFile(runtimeState.server.envFile)
+    : null;
+  if (!env) {
+    throw new Error(`worker not found: ${target}`);
+  }
+  return summarizeWorkerEnv(env, runtimeState?.server?.envFile || '');
+}
+
+async function readWorkerRuntimeSnapshotByName(name) {
+  return snapshotWorkerRuntime(safeWorkerName(name));
+}
+
+async function persistWorkerRuntimeComponent(name, component, patch = {}) {
+  const target = safeWorkerName(name);
+  const state = await readWorkerRuntimeState(target) || { name: target };
+  const next = {
+    ...state,
+    name: target,
+    updatedAt: nowIso(),
+    [component]: {
+      ...(state[component] || {}),
+      ...patch,
+    },
+  };
+  await writeWorkerRuntimeState(target, next);
+  return next;
+}
+
+async function stopWorkerRuntimeComponent(name, component) {
+  const target = safeWorkerName(name);
+  const state = await readWorkerRuntimeState(target);
+  const pid = Number(state?.[component]?.pid || 0) || 0;
+  if (!pid) {
+    const runtime = await persistWorkerRuntimeComponent(target, component, {
+      status: 'stopped',
+      stoppedAt: nowIso(),
+      pid: null,
+    });
+    return {
+      ok: true,
+      worker: target,
+      component,
+      runtime,
+    };
+  }
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // ignore
+    }
+  }
+  const runtime = await persistWorkerRuntimeComponent(target, component, {
+    status: 'stopped',
+    stoppedAt: nowIso(),
+    pid: null,
+  });
+  return {
+    ok: true,
+    worker: target,
+    component,
+    runtime,
+  };
+}
+
+async function spawnWorkerComponent(name, component) {
+  const target = safeWorkerName(name);
+  const worker = await findWorkerSummary(target);
+  const envFile = worker.filePath;
+  const runtimeDir = workerRuntimeDir(target);
+  await ensureDir(runtimeDir);
+  const script = component === 'tunnel'
+    ? path.join(repoRoot, 'scripts', 'worker-tunnel.sh')
+    : path.join(repoRoot, 'scripts', 'worker-server.sh');
+  const logPath = workerRuntimeLogPath(target, component);
+  const pidPath = workerRuntimePidPath(target, component);
+  const child = spawn('/usr/bin/env', ['bash', script, target], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: cleanSpawnEnv({
+      WORKBENCH_ENV_FILE: envFile,
+      MCP_RUNTIME_DIR: runtimeRoot,
+    }),
+  });
+
+  child.stdout.on('data', (chunk) => {
+    void fsp.appendFile(logPath, chunk).catch(() => {});
+  });
+  child.stderr.on('data', (chunk) => {
+    void fsp.appendFile(logPath, chunk).catch(() => {});
+  });
+
+  child.unref();
+
+  return persistWorkerRuntimeComponent(target, component, {
+    pid: child.pid,
+    pidPath: safeSignalPath(pidPath),
+    logPath: safeSignalPath(logPath),
+    status: 'running',
+    startedAt: nowIso(),
+    command: `${path.basename(script)} ${target}`,
+    envFile,
+  });
+}
+
+async function startWorkerRuntimeComponent(name, component) {
+  const state = await spawnWorkerComponent(name, component);
+  return {
+    ok: true,
+    worker: safeWorkerName(name),
+    component,
+    runtime: state,
+  };
+}
+
+async function restartWorkerRuntimeComponent(name, component) {
+  await stopWorkerRuntimeComponent(name, component);
+  return startWorkerRuntimeComponent(name, component);
+}
+
+async function createWorkerFromDashboard(payload = {}) {
+  const name = safeWorkerName(payload.name);
+  const client = String(payload.client || name).trim().toLowerCase();
+  const workspace = String(payload.workspace || '').trim();
+  if (!workspace) throw new Error('workspace is required');
+  const permission = String(payload.permission || 'yolo').trim().toLowerCase();
+  const port = Number(payload.port || 0);
+  if (!Number.isFinite(port) || port <= 0) throw new Error('port is required');
+  const tunnelMode = String(payload.tunnelMode || payload.tunnel_mode || 'quick').trim().toLowerCase();
+  const workflowMode = String(payload.workflowMode || payload.workflow_mode || 'sync').trim();
+  const overwrite = payload.overwrite === true;
+
+  const args = [
+    path.join(repoRoot, 'scripts', 'generate-worker.mjs'),
+    '--root', repoRoot,
+    '--name', name,
+    '--client', client,
+    '--workspace', workspace,
+    '--permission', permission,
+    '--port', String(port),
+    '--tunnel-mode', tunnelMode,
+    '--workflow-mode', workflowMode,
+  ];
+
+  if (payload.serverCmd) {
+    args.push('--server-cmd', String(payload.serverCmd));
+  }
+  if (payload.tunnelUrl) {
+    args.push('--tunnel-url', String(payload.tunnelUrl));
+  }
+  if (payload.token) {
+    args.push('--token', String(payload.token));
+  }
+  if (overwrite) {
+    args.push('--overwrite');
+  }
+
+  const result = spawnSync(process.execPath, args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: cleanSpawnEnv(),
+  });
+
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || 'worker generation failed');
+  }
+
+  return {
+    ok: true,
+    worker: name,
+    client,
+    permission,
+    port,
+    workspace,
+    stdout: String(result.stdout || '').trim(),
+    stderr: String(result.stderr || '').trim(),
+    envFile: path.join(repoRoot, '.mcp-workbench', 'workers', `${name}.env`),
   };
 }
 
@@ -3381,7 +3838,7 @@ async function handleRpc(req, res, urlObj) {
 const server = http.createServer((req, res) => {
   const urlObj = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`);
 
-  applyCorsHeaders(req, res);
+  applyCorsHeaders(req, res, urlObj);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -3394,9 +3851,14 @@ const server = http.createServer((req, res) => {
       sendHtml(res, 401, '<!doctype html><title>mcp-workbench dashboard</title><p>unauthorized</p>');
       return;
     }
-    buildDashboardPayload(urlObj)
+    buildDashboardPayload(urlObj, {
+      exposeSecrets: false,
+    })
       .then((state) => {
-        sendHtml(res, 200, renderDashboardPage(state));
+        sendHtml(res, 200, renderDashboardPage(state, {
+          actionToken: isLocalDashboardRequest(req) ? dashboardActionToken : '',
+          localOnly: isLocalDashboardRequest(req),
+        }));
       })
       .catch((error) => {
         sendHtml(res, 500, `<!doctype html><title>mcp-workbench dashboard</title><pre>${String(error?.stack || error)}</pre>`);
@@ -3409,7 +3871,9 @@ const server = http.createServer((req, res) => {
       sendJson(res, 401, { error: 'unauthorized' });
       return;
     }
-    buildDashboardPayload(urlObj)
+    buildDashboardPayload(urlObj, {
+      exposeSecrets: false,
+    })
       .then((state) => {
         sendJson(res, 200, state);
       })
@@ -3459,6 +3923,143 @@ const server = http.createServer((req, res) => {
       })
       .catch((error) => {
         sendJson(res, 500, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname === '/api/workspace-info') {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    Promise.all([
+      summarizeWorkerEnv(process.env, process.env.WORKBENCH_ENV_FILE || path.join(root, '.env')),
+      snapshotWorkerRuntime(String(process.env.WORKBENCH_WORKER_NAME || serverName.replace(/^mcp-workbench-/, '') || 'mcp-workbench')),
+    ]).then(([summary, runtime]) => {
+      sendJson(res, 200, buildWorkspaceInfoFromSummary(summary, runtime, { includeSecrets: false }));
+    }).catch((error) => {
+      sendJson(res, 500, { error: String(error?.message || error) });
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && /^\/api\/workers\/[^/]+\/auth-header$/.test(urlObj.pathname)) {
+    if (!isDashboardActionAuthorized(req)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    const parts = urlObj.pathname.split('/').filter(Boolean);
+    const workerName = decodeURIComponent(parts[2] || '');
+    findWorkerSummary(workerName)
+      .then((summary) => {
+        sendJson(res, 200, {
+          ok: true,
+          worker: summary.name,
+          authMode: summary.authMode,
+          authHeader: summary.authHeader || '',
+          authHint: summary.authHint,
+          tokenPresent: summary.tokenPresent,
+        });
+      })
+      .catch((error) => {
+        sendJson(res, 400, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'GET' && /^\/api\/workers\/[^/]+\/runtime$/.test(urlObj.pathname)) {
+    if (!isLocalDashboardRequest(req) && !authorize(req, urlObj)) {
+      sendJson(res, 401, { error: 'unauthorized' });
+      return;
+    }
+    const parts = urlObj.pathname.split('/').filter(Boolean);
+    const workerName = decodeURIComponent(parts[2] || '');
+    readWorkerRuntimeSnapshotByName(workerName)
+      .then((runtime) => {
+        sendJson(res, 200, {
+          ok: true,
+          worker: safeWorkerName(workerName),
+          runtime,
+        });
+      })
+      .catch((error) => {
+        sendJson(res, 500, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'POST' && urlObj.pathname === '/api/workers/create') {
+    if (!isDashboardActionAuthorized(req)) {
+      sendJson(res, 403, { error: 'dashboard actions are local-only and require the dashboard action token' });
+      return;
+    }
+    readBody(req)
+      .then((body) => createWorkerFromDashboard(body))
+      .then((result) => {
+        sendJson(res, 200, result);
+      })
+      .catch((error) => {
+        sendJson(res, 400, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  const workerActionMatch = urlObj.pathname.match(/^\/api\/workers\/([^/]+)\/(server|tunnel)\/(start|stop|restart)$/);
+  if (req.method === 'POST' && workerActionMatch) {
+    if (!isDashboardActionAuthorized(req)) {
+      sendJson(res, 403, { error: 'dashboard actions are local-only and require the dashboard action token' });
+      return;
+    }
+    const workerName = decodeURIComponent(workerActionMatch[1] || '');
+    const component = workerActionMatch[2];
+    const action = workerActionMatch[3];
+    const handler = action === 'start'
+      ? startWorkerRuntimeComponent
+      : action === 'stop'
+        ? stopWorkerRuntimeComponent
+        : restartWorkerRuntimeComponent;
+    handler(workerName, component)
+      .then((result) => {
+        sendJson(res, 200, result);
+      })
+      .catch((error) => {
+        sendJson(res, 400, { error: String(error?.message || error) });
+      });
+    return;
+  }
+
+  if (req.method === 'POST' && /^\/api\/workers\/[^/]+\/(doctor|validate)$/.test(urlObj.pathname)) {
+    if (!isDashboardActionAuthorized(req)) {
+      sendJson(res, 403, { error: 'dashboard actions are local-only and require the dashboard action token' });
+      return;
+    }
+    const parts = urlObj.pathname.split('/').filter(Boolean);
+    const workerName = decodeURIComponent(parts[2] || '');
+    const action = parts[3];
+    findWorkerSummary(workerName)
+      .then((summary) => {
+        const envFile = summary.filePath;
+        const command = action === 'doctor'
+          ? ['bash', path.join(repoRoot, 'scripts', 'worker-doctor.sh'), workerName]
+          : ['node', path.join(repoRoot, 'scripts', 'validate-config.mjs')];
+        const result = spawnSync(command[0], command.slice(1), {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          env: cleanSpawnEnv({
+            WORKBENCH_ENV_FILE: envFile,
+          }),
+        });
+        sendJson(res, result.status === 0 ? 200 : 400, {
+          ok: result.status === 0,
+          worker: workerName,
+          action,
+          stdout: String(result.stdout || ''),
+          stderr: String(result.stderr || ''),
+          exitCode: result.status,
+        });
+      })
+      .catch((error) => {
+        sendJson(res, 400, { error: String(error?.message || error) });
       });
     return;
   }

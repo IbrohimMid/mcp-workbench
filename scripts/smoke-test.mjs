@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
@@ -21,6 +22,19 @@ function assert(condition, message) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function baseEnv(extra = {}) {
+  return {
+    HOME: process.env.HOME,
+    USER: process.env.USER,
+    PATH: process.env.PATH,
+    TMPDIR: process.env.TMPDIR,
+    LANG: process.env.LANG,
+    LC_ALL: process.env.LC_ALL,
+    TERM: process.env.TERM,
+    ...extra,
+  };
 }
 
 async function getFreePort() {
@@ -82,6 +96,11 @@ async function main() {
   const presetDir = path.join(workspaceDir, 'workflow-presets');
   const workspaceSignalFiltersDir = path.join(workspaceDir, '.mcp-workbench', 'signal-filters');
   const secretValue = 'super-secret-123';
+  const createdWorkerName = 'panel-chatgpt';
+  let createdWorkerPort = null;
+  let createdWorkerEnvFile = null;
+  let dashboardActionToken = '';
+  let createdWorkerStarted = false;
   await fs.mkdir(workspaceDir, { recursive: true });
   await fs.mkdir(generatedRoot, { recursive: true });
   await fs.mkdir(jobDir, { recursive: true });
@@ -143,10 +162,9 @@ async function main() {
 
   const workerDoctor = spawnSync('bash', ['-lc', 'WORKBENCH_ENV_FILE="$WORKBENCH_ENV_FILE" ./scripts/worker-doctor.sh chatgpt'], {
     cwd: root,
-    env: {
-      ...process.env,
+    env: baseEnv({
       WORKBENCH_ENV_FILE: chatgptEnvPath,
-    },
+    }),
     encoding: 'utf8',
   });
   assert(workerDoctor.status === 0, `worker-doctor wrapper failed: ${workerDoctor.stderr || workerDoctor.stdout}`);
@@ -222,7 +240,7 @@ async function main() {
 
   const port = await getFreePort();
   const env = {
-    ...process.env,
+    ...baseEnv(),
     WORKSPACE_DIR: workspaceDir,
     MCP_TOKEN: token,
     MCP_HOST: '127.0.0.1',
@@ -232,6 +250,8 @@ async function main() {
     MCP_ENABLE_BASH: '1',
     MCP_WORKFLOW_JOB_DIR: jobDir,
     MCP_WORKFLOW_PRESET_DIR: presetDir,
+    MCP_SIGNAL_FILTER_DIR: workspaceSignalFiltersDir,
+    MCP_SIGNAL_TRUST_REGISTRY: path.join(tmp, 'trusted-workspaces.json'),
   };
 
   const child = spawn(process.execPath, [serverPath], {
@@ -307,9 +327,20 @@ async function main() {
     const tools = await rpc(baseUrl, sessionId, 'tools/list', {}, { id: 'tools' });
     assert(tools.status === 200, `tools/list failed with ${tools.status}`);
     const toolNames = (tools.body?.result?.tools || []).map((tool) => tool.name);
-    for (const required of ['read', 'write', 'edit', 'apply_patch', 'bash', 'workflow', 'workflow_presets', 'signal', 'job_retrieve', 'signal_diff', 'signal_filters', 'trust_workspace_filters']) {
+    for (const required of ['read', 'write', 'edit', 'apply_patch', 'bash', 'workflow', 'workflow_presets', 'signal', 'job_retrieve', 'signal_diff', 'signal_filters', 'trust_workspace_filters', 'workspace_info']) {
       assert(toolNames.includes(required), `missing tool: ${required}`);
     }
+
+    const workspaceInfo = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'workspace_info',
+      arguments: {},
+    }, { id: 'workspace-info' });
+    assert(workspaceInfo.status === 200, `workspace_info failed with ${workspaceInfo.status}`);
+    const workspaceInfoJson = JSON.parse(workspaceInfo.body?.result?.content?.[0]?.text || '{}');
+    assert(workspaceInfoJson.workspace?.root === workspaceDir, 'workspace_info root mismatch');
+    assert(workspaceInfoJson.worker?.workspace === workspaceDir, 'workspace_info worker workspace mismatch');
+    assert(!JSON.stringify(workspaceInfoJson).includes(token), 'workspace_info leaked MCP_TOKEN');
+    assert(JSON.stringify(workspaceInfoJson).includes('[REDACTED]'), 'workspace_info should redact auth');
 
     const read = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'read',
@@ -422,7 +453,7 @@ async function main() {
         command: [
           `printf 'token=${secretValue}\\n'`,
           `printf 'Authorization: Bearer ${secretValue}\\n'`,
-          'printf "secret job done\\n"',
+          'sleep 1',
         ].join('; '),
         cwd: '.',
         description: 'secret redaction smoke test',
@@ -435,23 +466,24 @@ async function main() {
 
     let secretSignal = null;
     for (let i = 0; i < 40; i += 1) {
-      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+      const signalRes = await rpc(baseUrl, sessionId, 'tools/call', {
         name: 'signal',
         arguments: { jobId: secretJobId, includeRaw: true },
-      }, { id: `secret-signal-${i}` });
-      assert(statusRes.status === 200, `secret signal failed with ${statusRes.status}`);
-      secretSignal = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
-      if (secretSignal.status && secretSignal.status !== 'running' && secretSignal.status !== 'queued') {
+      }, { id: `secret-full-signal-${i}` });
+      assert(signalRes.status === 200, `secret signal failed with ${signalRes.status}`);
+      secretSignal = JSON.parse(signalRes.body?.result?.content?.[0]?.text || '{}');
+      if (secretSignal.raw && (secretSignal.raw.stdout || secretSignal.raw.stderr)) {
         break;
       }
       await sleep(150);
     }
-    assert(secretSignal && secretSignal.status === 'completed', `secret job did not complete: ${JSON.stringify(secretSignal)}`);
+
     const secretBlob = JSON.stringify(secretSignal);
     assert(!secretBlob.includes(secretValue), 'secret leaked into signal JSON');
     assert(secretSignal.rawWarning, 'includeRaw should surface a warning');
+    assert(secretSignal.raw && typeof secretSignal.raw.stdout === 'string' && typeof secretSignal.raw.stderr === 'string', 'includeRaw should expose raw stdout/stderr');
     assert(secretSignal.rawPaths && !path.isAbsolute(secretSignal.rawPaths.stdout), 'raw stdout path should not be absolute');
-    assert(secretSignal.raw && !JSON.stringify(secretSignal.raw).includes(secretValue), 'secret leaked into raw signal output');
+    assert(!JSON.stringify(secretSignal.raw).includes(secretValue), 'secret leaked into raw signal output');
 
     const filtersBeforeTrust = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'signal_filters',
@@ -544,10 +576,24 @@ async function main() {
     assert(debugHealthJson.workspace === workspaceDir, 'debug health workspace mismatch');
     assert(Array.isArray(debugHealthJson.enabledTools), 'debug health missing enabledTools');
 
+    const apiWorkspaceInfo = await fetch(`${baseUrl}/api/workspace-info`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+      },
+    });
+    assert(apiWorkspaceInfo.status === 200, `api workspace info failed with ${apiWorkspaceInfo.status}`);
+    const apiWorkspaceInfoJson = await apiWorkspaceInfo.json();
+    assert(apiWorkspaceInfoJson.workspace && apiWorkspaceInfoJson.workspace.root === workspaceDir, 'api workspace info root mismatch');
+    assert(!JSON.stringify(apiWorkspaceInfoJson).includes(token), 'api workspace info leaked MCP_TOKEN');
+    assert(JSON.stringify(apiWorkspaceInfoJson).includes('[REDACTED]'), 'api workspace info should redact auth');
+
     const dashboard = await fetch(`${baseUrl}/dashboard`);
     assert(dashboard.status === 200, `dashboard failed with ${dashboard.status}`);
     const dashboardHtml = await dashboard.text();
     assert(dashboardHtml.includes('mcp-workbench dashboard'), 'dashboard html missing title');
+    const dashboardActionTokenMatch = dashboardHtml.match(/name="mcp-dashboard-action-token" content="([^"]*)"/);
+    assert(dashboardActionTokenMatch && dashboardActionTokenMatch[1], 'dashboard missing action token');
+    dashboardActionToken = dashboardActionTokenMatch[1];
 
     const dashboardState = await fetch(`${baseUrl}/api/dashboard`);
     assert(dashboardState.status === 200, `dashboard state failed with ${dashboardState.status}`);
@@ -555,10 +601,133 @@ async function main() {
     assert(dashboardStateJson.ok === true, 'dashboard state missing ok flag');
     assert(dashboardStateJson.connection && dashboardStateJson.connection.mcpUrl, 'dashboard state missing mcpUrl');
     assert(dashboardStateJson.current && dashboardStateJson.current.permissionLabel, 'dashboard state missing current worker summary');
+    assert(dashboardStateJson.workspaceInfo && dashboardStateJson.workspaceInfo.worker, 'dashboard state missing workspaceInfo');
+    assert(dashboardStateJson.workspaceInfo.workspace && dashboardStateJson.workspaceInfo.workspace.root === workspaceDir, 'dashboard state workspaceInfo root mismatch');
+    assert(!JSON.stringify(dashboardStateJson).includes(token), 'dashboard state leaked MCP_TOKEN');
     const dashboardJobs = await fetch(`${baseUrl}/api/jobs`);
     assert(dashboardJobs.status === 200, `dashboard jobs failed with ${dashboardJobs.status}`);
     const dashboardJobsJson = await dashboardJobs.json();
     assert(Array.isArray(dashboardJobsJson.jobs), 'dashboard jobs missing jobs array');
+    assert(String(dashboard.headers.get('access-control-allow-origin') || '') !== '*', 'dashboard should not allow wildcard CORS');
+
+    const actionHeaders = {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'x-mcp-dashboard-token': dashboardActionToken,
+    };
+
+    const spoofedCreate = await fetch(`${baseUrl}/api/workers/create`, {
+      method: 'POST',
+      headers: {
+        ...actionHeaders,
+        'x-forwarded-host': 'public.example.com',
+      },
+      body: JSON.stringify({
+        name: 'spoofed-worker',
+        client: 'chatgpt',
+        workspace: workspaceDir,
+        permission: 'yolo',
+        port: 39999,
+        tunnelMode: 'quick',
+      }),
+    });
+    assert(spoofedCreate.status === 403, `spoofed dashboard action should fail with 403, got ${spoofedCreate.status}`);
+
+    createdWorkerPort = await getFreePort();
+    const createdWorker = await fetch(`${baseUrl}/api/workers/create`, {
+      method: 'POST',
+      headers: actionHeaders,
+      body: JSON.stringify({
+        name: createdWorkerName,
+        client: 'chatgpt',
+        workspace: workspaceDir,
+        permission: 'yolo',
+        port: createdWorkerPort,
+        tunnelMode: 'quick',
+      }),
+    });
+    assert(createdWorker.status === 200, `worker create failed with ${createdWorker.status}`);
+    const createdWorkerJson = await createdWorker.json();
+    assert(createdWorkerJson.ok === true, 'worker create missing ok flag');
+    assert(createdWorkerJson.envFile && String(createdWorkerJson.envFile).endsWith(`${createdWorkerName}.env`), 'worker create missing envFile');
+
+    createdWorkerEnvFile = path.join(root, '.mcp-workbench', 'workers', `${createdWorkerName}.env`);
+    assert(await fs.access(createdWorkerEnvFile).then(() => true).catch(() => false), 'created worker env file missing');
+
+    const authHeaderUnauthorized = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/auth-header`);
+    assert(authHeaderUnauthorized.status === 401, `auth-header without token should fail with 401, got ${authHeaderUnauthorized.status}`);
+
+    const authHeaderResponse = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/auth-header`, {
+      headers: {
+        'x-mcp-dashboard-token': dashboardActionToken,
+      },
+    });
+    assert(authHeaderResponse.status === 200, `auth-header failed with ${authHeaderResponse.status}`);
+    const authHeaderJson = await authHeaderResponse.json();
+    assert(authHeaderJson.authMode === 'bearer', 'auth-header mode mismatch');
+    assert(String(authHeaderJson.authHeader || '').startsWith('Authorization: Bearer '), 'auth-header did not return bearer token');
+
+    const startServer = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/start`, {
+      method: 'POST',
+      headers: actionHeaders,
+      body: '{}',
+    });
+    const startServerText = await startServer.text();
+    assert(startServer.status === 200, `worker server start failed with ${startServer.status}: ${startServerText}`);
+    const startServerJson = JSON.parse(startServerText || '{}');
+    assert(startServerJson.ok === true, 'worker server start missing ok flag');
+    createdWorkerStarted = true;
+
+    for (let i = 0; i < 40; i += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${createdWorkerPort}/health`);
+        if (res.ok) break;
+      } catch {
+        // retry
+      }
+      await sleep(250);
+      if (i === 39) throw new Error('created worker server did not become ready');
+    }
+
+    const createdWorkerHealth = await fetch(`http://127.0.0.1:${createdWorkerPort}/health`);
+    assert(createdWorkerHealth.status === 200, `created worker health failed with ${createdWorkerHealth.status}`);
+
+    const createdWorkerRuntimeDir = path.join(workspaceDir, '.mcp-workbench', 'runtime', 'workers', createdWorkerName);
+    const createdWorkerRuntimeStatePath = path.join(createdWorkerRuntimeDir, 'state.json');
+    const createdWorkerTunnelLogPath = path.join(createdWorkerRuntimeDir, 'tunnel.log');
+    for (let i = 0; i < 20; i += 1) {
+      if (await fs.access(createdWorkerRuntimeStatePath).then(() => true).catch(() => false)) break;
+      await sleep(100);
+      if (i === 19) throw new Error(`created worker runtime state missing: ${createdWorkerRuntimeStatePath}`);
+    }
+    const createdWorkerRuntimeState = JSON.parse(await fs.readFile(createdWorkerRuntimeStatePath, 'utf8'));
+    const fakeTunnelUrl = 'https://smoke-tunnel-example.trycloudflare.com';
+    await fs.writeFile(createdWorkerTunnelLogPath, `2026-01-01T00:00:00Z INF Your quick Tunnel is ready at ${fakeTunnelUrl}\n`, 'utf8');
+    await fs.writeFile(createdWorkerRuntimeStatePath, JSON.stringify({
+      ...createdWorkerRuntimeState,
+      tunnel: {
+        ...(createdWorkerRuntimeState.tunnel || {}),
+        pid: createdWorkerRuntimeState.tunnel?.pid || 424242,
+        status: createdWorkerRuntimeState.tunnel?.status || 'running',
+      },
+    }, null, 2), 'utf8');
+
+    const dashboardWithTunnel = await fetch(`${baseUrl}/api/dashboard?worker=${encodeURIComponent(createdWorkerName)}`);
+    assert(dashboardWithTunnel.status === 200, `dashboard with tunnel failed with ${dashboardWithTunnel.status}`);
+    const dashboardWithTunnelJson = await dashboardWithTunnel.json();
+    assert(dashboardWithTunnelJson.connection && dashboardWithTunnelJson.connection.publicConnectorUrl === `${fakeTunnelUrl}/mcp`, 'dashboard did not surface public connector URL');
+    assert(dashboardWithTunnelJson.tunnel && dashboardWithTunnelJson.tunnel.publicUrl === fakeTunnelUrl, 'dashboard did not surface tunnel public URL');
+    assert(String(dashboardWithTunnelJson.tunnel?.logTail || '').includes(fakeTunnelUrl), 'dashboard did not surface tunnel log tail');
+
+    const stopServer = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/stop`, {
+      method: 'POST',
+      headers: actionHeaders,
+      body: '{}',
+    });
+    assert(stopServer.status === 200, `worker server stop failed with ${stopServer.status}`);
+    const stopServerJson = await stopServer.json();
+    assert(stopServerJson.ok === true, 'worker server stop missing ok flag');
+    createdWorkerStarted = false;
 
     const presetList = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'workflow_presets',
@@ -745,6 +914,25 @@ async function main() {
     console.error(stderr || '(empty)');
     process.exitCode = 1;
   } finally {
+    if (createdWorkerStarted && dashboardActionToken) {
+      try {
+        await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/stop`, {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+            'x-mcp-dashboard-token': dashboardActionToken,
+          },
+          body: '{}',
+        });
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+    if (createdWorkerEnvFile) {
+      await fs.rm(createdWorkerEnvFile, { force: true }).catch(() => {});
+      await fs.rm(path.join(root, '.mcp-workbench', 'runtime', 'workers', createdWorkerName), { recursive: true, force: true }).catch(() => {});
+    }
     await cleanup();
   }
 }

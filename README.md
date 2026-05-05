@@ -239,9 +239,12 @@ The dashboard shows:
 
 - worker profiles and permission badges
 - connector URLs and auth hints
+- workspace and runtime info for the selected worker
+- local-only controls for create/start/stop/restart actions
 - job timeline
 - selected job signal summary
 - quick tunnel or named tunnel notes
+- `workspace_info` details for the active worker boundary and runtime
 
 This `mcp-workbench dashboard` is the quickest way to inspect worker state without reading env files by hand.
 

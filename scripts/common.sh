@@ -18,12 +18,26 @@ load_env() {
   root="$(workbench_root)"
   env_file="${WORKBENCH_ENV_FILE:-${root}/.env}"
 
+  clear_workbench_env
+  export WORKBENCH_ENV_FILE="${env_file}"
+
   if [[ -f "${env_file}" ]]; then
     set -a
     # shellcheck disable=SC1090
     source "${env_file}"
     set +a
   fi
+}
+
+clear_workbench_env() {
+  local key
+  while IFS='=' read -r key _; do
+    case "$key" in
+      MCP_*|WORKBENCH_*|TUNNEL_*|CLOUDFLARED_*|WORKSPACE_DIR)
+        unset -v "$key"
+        ;;
+    esac
+  done < <(env)
 }
 
 worker_env_file() {
