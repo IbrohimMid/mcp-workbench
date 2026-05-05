@@ -238,7 +238,9 @@ make dashboard
 The dashboard shows:
 
 - worker profiles and permission badges
-- connector URLs and auth hints
+- `Public connector URL` for ChatGPT / Notion
+- `Local MCP URL` for localhost debugging only
+- auth hints and copy buttons
 - workspace and runtime info for the selected worker
 - local-only controls for create/start/stop/restart actions
 - job timeline
@@ -247,6 +249,17 @@ The dashboard shows:
 - `workspace_info` details for the active worker boundary and runtime
 
 This `mcp-workbench dashboard` is the quickest way to inspect worker state without reading env files by hand.
+
+To create a new worker from the dashboard:
+
+1. Fill `Worker name`, `Client`, `Workspace`, `Permission`, and `Port`.
+2. Click `Create worker`.
+3. Click `Start server`.
+4. Click `Start tunnel`.
+5. Copy `Public connector URL` into ChatGPT or Notion.
+6. Copy auth if the worker uses bearer auth.
+
+Use `Local MCP URL` only when you are debugging on the same machine.
 
 The same dashboard also works for a selected worker profile when you pass `?worker=<name>` or `?job=<jobId>` in the URL.
 

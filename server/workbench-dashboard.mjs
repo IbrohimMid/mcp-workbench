@@ -161,6 +161,36 @@ export function renderDashboardPage(state, options = {}) {
     .hero h1 { margin: 0 0 6px; font-size: 28px; line-height: 1.05; }
     .hero p { margin: 0; color: var(--muted); max-width: 720px; }
     .hero .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .quickstart {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255,255,255,.03);
+      max-width: 860px;
+    }
+    .quickstart strong { display: block; margin-bottom: 8px; color: var(--text); }
+    .quickstart ol { margin: 0; padding-left: 18px; color: var(--soft); }
+    .quickstart li { margin: 6px 0; }
+    .quickstart code { padding: 2px 6px; border-radius: 8px; border: 1px solid var(--line); background: rgba(255,255,255,.04); }
+    .guide {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid rgba(124, 167, 255, .28);
+      border-radius: 14px;
+      background: rgba(124, 167, 255, .06);
+      max-width: 860px;
+    }
+    .guide strong { display: block; margin-bottom: 8px; color: var(--text); }
+    .guide ul { margin: 0; padding-left: 18px; color: var(--soft); }
+    .guide li { margin: 6px 0; }
+    .guide code {
+      padding: 2px 6px;
+      border-radius: 8px;
+      border: 1px solid rgba(124, 167, 255, .24);
+      background: rgba(255,255,255,.04);
+    }
+    .guide .muted { margin-top: 10px; }
     .chip, .badge {
       display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px;
       border: 1px solid var(--line); color: var(--soft); background: rgba(255,255,255,.03); font-size: 12px;
@@ -244,6 +274,11 @@ export function renderDashboardPage(state, options = {}) {
       color: var(--muted);
       font-size: 12px;
     }
+    .form-grid small {
+      display: block;
+      line-height: 1.35;
+      color: var(--muted);
+    }
     .form-grid label.wide { grid-column: 1 / -1; }
     .form-grid input,
     .form-grid select {
@@ -278,10 +313,28 @@ export function renderDashboardPage(state, options = {}) {
           <span class="chip">${escapeHtml(current.authMode || 'bearer')}</span>
           <span class="chip">${escapeHtml(state.server?.name || 'mcp-workbench')}</span>
         </div>
+        <div class="guide">
+          <strong>Which URL should you paste?</strong>
+          <ul>
+            <li><code>Public connector URL</code> goes into ChatGPT or Notion.</li>
+            <li><code>Local MCP URL</code> is only for localhost debugging on this machine.</li>
+            <li>If auth is <code>bearer</code>, click <code>Copy auth</code> and paste that in the client too.</li>
+            <li>To create a worker: fill the form below, click <code>Create worker</code>, then <code>Start server</code> and <code>Start tunnel</code>.</li>
+          </ul>
+          <div class="muted">For quick tunnels, the public URL can change after restart. Use a named tunnel if you want a stable connector URL.</div>
+        </div>
+        <div class="quickstart">
+          <strong>Quick start</strong>
+          <ol>
+            <li>Create a worker profile if you do not already have one.</li>
+            <li>Click <strong>Start server</strong> and then <strong>Start tunnel</strong>.</li>
+            <li>Copy <strong>Public connector URL</strong> for ChatGPT or Notion. Use <strong>Local MCP URL</strong> only for localhost debugging.</li>
+          </ol>
+        </div>
       </div>
       <div class="copy-row">
-        <button class="btn" id="copy-public-connector-url" data-copy="${escapeHtml(connection.publicConnectorUrl || '')}" ${connection.publicConnectorUrl ? '' : 'disabled'}>Copy public connector URL</button>
-        <button class="btn" id="copy-local-mcp-url" data-copy="${escapeHtml(connection.mcpUrl || '')}" ${connection.mcpUrl ? '' : 'disabled'}>Copy local MCP URL</button>
+        <button class="btn" id="copy-public-connector-url" data-copy="${escapeHtml(connection.publicConnectorUrl || '')}" ${connection.publicConnectorUrl ? '' : 'disabled'}>Copy URL for ChatGPT / Notion</button>
+        <button class="btn" id="copy-local-mcp-url" data-copy="${escapeHtml(connection.mcpUrl || '')}" ${connection.mcpUrl ? '' : 'disabled'}>Copy localhost URL</button>
         <button class="btn" id="copy-auth" ${localOnly && current.authMode !== 'no-auth' ? '' : 'disabled'}>Copy auth</button>
         <button class="btn" data-copy="${escapeHtml(connection.dashboardUrl || '')}">Copy dashboard URL</button>
       </div>
@@ -317,7 +370,7 @@ export function renderDashboardPage(state, options = {}) {
           </div>
           <div class="body">
             <div class="kv">
-              <div class="kv-row"><strong>MCP URL</strong><span>${escapeHtml(connection.mcpUrl || '')}</span></div>
+              <div class="kv-row"><strong>Local MCP URL</strong><span>${escapeHtml(connection.mcpUrl || '')}</span></div>
               <div class="kv-row"><strong>Public connector URL</strong><span>${escapeHtml(connection.publicConnectorUrl || 'waiting for tunnel URL')}</span></div>
               <div class="kv-row"><strong>Dashboard URL</strong><span>${escapeHtml(connection.dashboardUrl || '')}</span></div>
               <div class="kv-row"><strong>Tunnel URL</strong><span>${escapeHtml(tunnel.tunnelUrl || 'not configured')}</span></div>
@@ -326,7 +379,7 @@ export function renderDashboardPage(state, options = {}) {
             </div>
             <div class="footer">
               <span>${escapeHtml(tunnel.modeLabel || 'quick tunnel ready')}</span>
-              <span>${escapeHtml(tunnel.hint || 'Use the browser to copy the public connector URL or auth header into ChatGPT / Notion.')}</span>
+              <span>${escapeHtml(tunnel.hint || 'Use the public connector URL in ChatGPT / Notion. The local MCP URL is only for localhost debugging.')}</span>
             </div>
             <div class="tunnel-log">
               <h4>Tunnel log tail</h4>
@@ -342,34 +395,41 @@ export function renderDashboardPage(state, options = {}) {
           </div>
           <div class="body">
             <p class="muted">Mutating actions stay local and require the dashboard action token.</p>
+            <p class="muted">Fill <strong>Worker name</strong>, <strong>Client</strong>, <strong>Workspace</strong>, <strong>Permission</strong>, and <strong>Port</strong>, then click <strong>Create worker</strong>.</p>
             <div class="form-grid">
               <label>
                 <span>Worker name</span>
                 <input id="worker-name" value="${escapeHtml(current.name || 'chatgpt')}" />
+                <small class="muted">Example: <code>chatgpt</code> or <code>notion</code>.</small>
               </label>
               <label>
                 <span>Client</span>
                 <input id="worker-client" value="${escapeHtml(current.client || 'chatgpt')}" />
+                <small class="muted">Use <code>chatgpt</code>, <code>notion</code>, or a custom label.</small>
               </label>
               <label class="wide">
                 <span>Workspace</span>
                 <input id="worker-workspace" value="${escapeHtml(current.workspace || workspaceInfo.worker?.workspace || '')}" />
+                <small class="muted">This is the folder the worker may access. Keep it narrow unless you explicitly want a wider boundary.</small>
               </label>
               <label>
                 <span>Permission</span>
                 <select id="worker-permission">
                   ${['readonly', 'standard', 'yolo'].map((value) => `<option value="${value}"${value === (current.permissionLabel || 'readonly') ? ' selected' : ''}>${value}</option>`).join('')}
                 </select>
+                <small class="muted"><code>yolo</code> enables write, shell, and webfetch, but still keeps the workspace boundary.</small>
               </label>
               <label>
                 <span>Port</span>
                 <input id="worker-port" type="number" min="1" step="1" value="${escapeHtml(String(current.port || 3333))}" />
+                <small class="muted">Use a unique port per worker.</small>
               </label>
               <label>
                 <span>Tunnel</span>
                 <select id="worker-tunnel">
                   ${['quick', 'named'].map((value) => `<option value="${value}"${value === (current.tunnelMode || 'quick') ? ' selected' : ''}>${value}</option>`).join('')}
                 </select>
+                <small class="muted"><code>quick</code> is easiest. <code>named</code> is stable.</small>
               </label>
             </div>
             <div class="copy-row action-row">
