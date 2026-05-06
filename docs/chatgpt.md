@@ -20,5 +20,6 @@ For long-running tasks, prefer the async job flow:
 - `job_retrieve`
 
 If you want batched actions, call `workflow` with either inline steps or a named preset.
+Inline workflow steps inherit the current worker capability set by default; use a preset only when you want to narrow the permissions.
 If your workspace uses local signal filters, trust them once with `trust_workspace_filters` before expecting them to apply.
 Use `signal_filters` to inspect which filters and distillers are active, and `job_retrieve` when you need raw logs again.

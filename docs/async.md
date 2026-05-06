@@ -22,12 +22,14 @@ This template supports a job-based MCP workflow pattern for long-running actions
 - `workflow_result`: fetch the final output by `job_id`
 - `workflow_cancel`: stop a queued or running job when supported
 
-Workflow permissions should default to a safe boundary:
+Workflow permissions should follow the active worker capability set by default:
 
 - filesystem read: on
-- filesystem write: off unless explicitly enabled
-- shell: off unless explicitly enabled
-- network: off unless explicitly enabled
+- filesystem write: follows the worker capability
+- shell: follows the worker capability
+- network: follows the worker capability
+
+Inline `workflow` calls inherit the currently enabled worker tools by default. Use a preset with explicit permissions when you want to narrow the scope.
 
 ## Why this avoids transport failures
 

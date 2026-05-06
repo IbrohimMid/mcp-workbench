@@ -52,6 +52,7 @@ function renderWorkerList(workers = []) {
         <span class="worker-title">
           <strong>${escapeHtml(worker.name)}</strong>
           <span>${escapeHtml(worker.client || 'unknown client')}</span>
+          <span class="worker-url">${escapeHtml(worker.publicConnectorUrl || worker.mcpUrl || 'waiting for URL')}</span>
         </span>
         <span class="worker-meta">
           ${badge(worker.permission || 'readonly', worker.permission || '')}
@@ -254,6 +255,7 @@ export function renderDashboardPage(state, options = {}) {
     .worker-row.selected, .job-row.selected { border-color: rgba(124,167,255,.6); box-shadow: inset 0 0 0 1px rgba(124,167,255,.22); }
     .worker-title, .job-main { display: grid; gap: 3px; }
     .worker-title span, .job-main span { color: var(--muted); font-size: 12px; }
+    .worker-url { color: var(--soft); font-size: 11px; line-height: 1.35; }
     .worker-meta, .job-meta { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     .empty { color: var(--muted); padding: 8px 0; }
     .signal-headline { font-size: 16px; margin: 0 0 6px; }
@@ -319,7 +321,7 @@ export function renderDashboardPage(state, options = {}) {
             <li><code>Public connector URL</code> goes into ChatGPT or Notion.</li>
             <li><code>Local MCP URL</code> is only for localhost debugging on this machine.</li>
             <li>If auth is <code>bearer</code>, click <code>Copy auth</code> and paste that in the client too.</li>
-            <li>To create a worker: fill the form below, click <code>Create worker</code>, then <code>Start server</code> and <code>Start tunnel</code>.</li>
+            <li>To create a worker: fill the form below, click <code>Create &amp; start worker</code>, then copy the public connector URL once it appears.</li>
           </ul>
           <div class="muted">For quick tunnels, the public URL can change after restart. Use a named tunnel if you want a stable connector URL.</div>
         </div>
@@ -327,7 +329,7 @@ export function renderDashboardPage(state, options = {}) {
           <strong>Quick start</strong>
           <ol>
             <li>Create a worker profile if you do not already have one.</li>
-            <li>Click <strong>Start server</strong> and then <strong>Start tunnel</strong>.</li>
+            <li>Create the worker, then the dashboard starts server and tunnel for you.</li>
             <li>Copy <strong>Public connector URL</strong> for ChatGPT or Notion. Use <strong>Local MCP URL</strong> only for localhost debugging.</li>
           </ol>
         </div>
@@ -395,12 +397,12 @@ export function renderDashboardPage(state, options = {}) {
           </div>
           <div class="body">
             <p class="muted">Mutating actions stay local and require the dashboard action token.</p>
-            <p class="muted">Fill <strong>Worker name</strong>, <strong>Client</strong>, <strong>Workspace</strong>, <strong>Permission</strong>, and <strong>Port</strong>, then click <strong>Create worker</strong>.</p>
+            <p class="muted">Fill <strong>Worker name</strong>, <strong>Client</strong>, <strong>Workspace</strong>, <strong>Permission</strong>, <strong>Boundary</strong>, and <strong>Port</strong>, then click <strong>Create &amp; start worker</strong>.</p>
             <div class="form-grid">
               <label>
                 <span>Worker name</span>
-                <input id="worker-name" value="${escapeHtml(current.name || 'chatgpt')}" />
-                <small class="muted">Example: <code>chatgpt</code> or <code>notion</code>.</small>
+                <input id="worker-name" value="${escapeHtml(state.suggestedWorkerName || current.name || 'chatgpt')}" />
+                <small class="muted">The dashboard suggests a new unique name so create does not overwrite the selected worker.</small>
               </label>
               <label>
                 <span>Client</span>
@@ -417,12 +419,20 @@ export function renderDashboardPage(state, options = {}) {
                 <select id="worker-permission">
                   ${['readonly', 'standard', 'yolo'].map((value) => `<option value="${value}"${value === (current.permissionLabel || 'readonly') ? ' selected' : ''}>${value}</option>`).join('')}
                 </select>
-                <small class="muted"><code>yolo</code> enables write, shell, and webfetch, but still keeps the workspace boundary.</small>
+                <small class="muted"><code>yolo</code> enables write, shell, and webfetch.</small>
+              </label>
+              <label>
+                <span>Boundary</span>
+                <select id="worker-boundary">
+                  <option value="workspace-bound"${workspaceInfo.boundary?.allowOutside ? '' : ' selected'}>workspace-bound</option>
+                  <option value="outside-workspace"${workspaceInfo.boundary?.allowOutside ? ' selected' : ''}>outside workspace allowed</option>
+                </select>
+                <small class="muted">Choose <code>outside workspace allowed</code> only when the worker should access paths beyond <code>WORKSPACE_DIR</code>.</small>
               </label>
               <label>
                 <span>Port</span>
-                <input id="worker-port" type="number" min="1" step="1" value="${escapeHtml(String(current.port || 3333))}" />
-                <small class="muted">Use a unique port per worker.</small>
+                <input id="worker-port" type="number" min="1" step="1" value="${escapeHtml(String(state.suggestedPort || current.port || 3333))}" />
+                <small class="muted">The dashboard suggests the next free port so each worker gets its own URL.</small>
               </label>
               <label>
                 <span>Tunnel</span>
@@ -433,7 +443,7 @@ export function renderDashboardPage(state, options = {}) {
               </label>
             </div>
             <div class="copy-row action-row">
-              <button class="btn" id="create-worker" ${localOnly ? '' : 'disabled'}>Create worker</button>
+              <button class="btn" id="create-worker" ${localOnly ? '' : 'disabled'}>Create &amp; start worker</button>
               <button class="btn" data-worker-action="server/start" ${localOnly ? '' : 'disabled'}>Start server</button>
               <button class="btn" data-worker-action="server/stop" ${localOnly ? '' : 'disabled'}>Stop server</button>
               <button class="btn" data-worker-action="server/restart" ${localOnly ? '' : 'disabled'}>Restart server</button>
@@ -616,6 +626,7 @@ export function renderDashboardPage(state, options = {}) {
         client: document.getElementById('worker-client').value.trim(),
         workspace: document.getElementById('worker-workspace').value.trim(),
         permission: document.getElementById('worker-permission').value,
+        allowOutsideWorkspace: document.getElementById('worker-boundary').value === 'outside-workspace',
         port: Number(document.getElementById('worker-port').value),
         tunnelMode: document.getElementById('worker-tunnel').value,
       };
@@ -629,9 +640,23 @@ export function renderDashboardPage(state, options = {}) {
       if (createButton) {
         createButton.addEventListener('click', async () => {
           try {
-            setActionStatus('Creating worker...');
-            await createWorkerFromForm();
-            setActionStatus('Worker created.');
+            setActionStatus('Creating worker and starting server/tunnel...');
+            const response = await createWorkerFromForm();
+            const workerLabel = response && response.worker ? String(response.worker) : 'worker';
+            const renamedNote = response && response.renamedFrom ? ' (requested ' + response.renamedFrom + ')' : '';
+            setActionStatus('Worker created as ' + workerLabel + renamedNote + '.' + (response && response.port ? ' Port ' + response.port + '.' : ''));
+            if (response && response.worker) {
+              selectedWorker = String(response.worker);
+              selectedJob = null;
+              const params = new URLSearchParams(window.location.search);
+              params.set('worker', selectedWorker);
+              params.delete('job');
+              window.history.replaceState({}, '', window.location.pathname + '?' + params.toString());
+            }
+            setActionStatus('Waiting for public connector URL...');
+            const ready = await refreshUntilConnectorReady();
+            setActionStatus(ready ? 'Public connector URL ready.' : 'Tunnel started, waiting for Cloudflare URL...');
+            await refresh();
           } catch (error) {
             setActionStatus(String(error && error.message ? error.message : error));
           }
@@ -693,7 +718,7 @@ export function renderDashboardPage(state, options = {}) {
           selectedWorker = button.getAttribute('data-worker');
           const params = new URLSearchParams(window.location.search);
           params.set('worker', selectedWorker || '');
-          if (selectedJob) params.set('job', selectedJob);
+          params.delete('job');
           window.location.search = params.toString();
         });
       });

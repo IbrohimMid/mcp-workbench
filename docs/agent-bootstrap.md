@@ -19,6 +19,7 @@ Recommended agent behavior:
 7. Tell the user the final URLs and auth mode.
 
 After the workers are created, use `make dashboard` to inspect the worker list, connector URL, auth hint, `workspace_info`, and selected job signal.
+The dashboard create form can also create a worker, start its server, and start its tunnel in one flow.
 In the dashboard, copy `Public connector URL` into ChatGPT or Notion. Use `Local MCP URL` only for localhost debugging.
 The dashboard also exposes local-only worker actions for create/start/stop/restart, but those stay guarded by the local action token.
 If you edit worker profiles, presets, or filters, run `make validate-config` before starting the worker.

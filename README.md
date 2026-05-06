@@ -252,12 +252,10 @@ This `mcp-workbench dashboard` is the quickest way to inspect worker state witho
 
 To create a new worker from the dashboard:
 
-1. Fill `Worker name`, `Client`, `Workspace`, `Permission`, and `Port`.
-2. Click `Create worker`.
-3. Click `Start server`.
-4. Click `Start tunnel`.
-5. Copy `Public connector URL` into ChatGPT or Notion.
-6. Copy auth if the worker uses bearer auth.
+1. Fill `Worker name`, `Client`, `Workspace`, `Permission`, `Boundary`, and `Port`.
+2. Click `Create & start worker`. The dashboard starts the worker's server and tunnel for you.
+3. Copy `Public connector URL` into ChatGPT or Notion.
+4. Copy auth if the worker uses bearer auth.
 
 Use `Local MCP URL` only when you are debugging on the same machine.
 
@@ -429,7 +427,7 @@ It is the default when `MCP_SERVER_CMD` is empty.
 
 - `codesearch` is grep-like workspace search, not a full indexed code database.
 - `lsp` is best-effort text matching for symbols, not a full language server.
-- `workflow` is a job wrapper that can run inline steps or a named preset.
+- `workflow` is a job wrapper that can run inline steps or a named preset. Inline steps inherit the current worker capability set by default.
 - `bash` returns a `job_id` immediately and should be followed by `bash_status`, `bash_tail`, or `bash_result`.
 - `workflow_presets` lists preset files from `MCP_WORKFLOW_PRESET_DIR` and can inspect a named preset.
 - `signal` is the built-in signal layer in this repo: it distills noisy job output into a compact summary, adds rewind refs, and keeps raw logs on disk.
@@ -521,7 +519,7 @@ Workflow presets live under `workflow-presets/`. Use `workflow_presets` to list 
 - ChatGPT: add `https://<your-tunnel>/mcp` as the connector URL. Use `Bearer <MCP_TOKEN>` if the UI offers bearer auth, or `?auth_token=<MCP_TOKEN>` only if you intentionally enabled query-token auth.
 - Notion: add `https://<your-tunnel>/mcp` to the custom MCP connector flow. If the workspace uses URL restrictions, add the same tunnel URL or a matching pattern such as `https://<your-tunnel>/*`.
 - If you want a single-call wrapper that batches multiple actions, use `workflow` instead of chaining many separate tool calls.
-- If you want repeatable bundles, add a preset file under `workflow-presets/` and call `workflow` with `preset: <name>`.
+- If you want repeatable bundles or a tighter scope, add a preset file under `workflow-presets/` and call `workflow` with `preset: <name>`.
 
 ## Troubleshooting
 

@@ -96,7 +96,7 @@ async function main() {
   const presetDir = path.join(workspaceDir, 'workflow-presets');
   const workspaceSignalFiltersDir = path.join(workspaceDir, '.mcp-workbench', 'signal-filters');
   const secretValue = 'super-secret-123';
-  const createdWorkerName = 'panel-chatgpt';
+  let createdWorkerName = 'panel-chatgpt';
   let createdWorkerPort = null;
   let createdWorkerEnvFile = null;
   let dashboardActionToken = '';
@@ -153,6 +153,22 @@ async function main() {
   assert(notionEnv.includes("MCP_ENABLE_BASH='1'"), 'notion env should enable bash for yolo');
   assert(notionEnv.includes("MCP_ALLOW_OUTSIDE_WORKSPACE='0'"), 'notion env should keep workspace boundary');
   assert(chatgptEnv !== notionEnv, 'worker env files should differ');
+
+  const openWorkerEnvName = 'notion-open';
+  const openWorker = spawnSync(process.execPath, [
+    path.join(root, 'scripts', 'generate-worker.mjs'),
+    '--root', generatedRoot,
+    '--name', openWorkerEnvName,
+    '--client', 'notion',
+    '--workspace', workspaceDir,
+    '--permission', 'yolo',
+    '--port', '3335',
+    '--allow-outside-workspace',
+  ], { encoding: 'utf8' });
+  assert(openWorker.status === 0, `open worker generator failed: ${openWorker.stderr || openWorker.stdout}`);
+  const openWorkerEnvPath = path.join(generatedRoot, '.mcp-workbench', 'workers', `${openWorkerEnvName}.env`);
+  const openWorkerEnv = await fs.readFile(openWorkerEnvPath, 'utf8');
+  assert(openWorkerEnv.includes("MCP_ALLOW_OUTSIDE_WORKSPACE='1'"), 'open worker should allow outside workspace');
 
   const validateConfig = spawnSync(process.execPath, [
     path.join(root, 'scripts', 'validate-config.mjs'),
@@ -276,8 +292,20 @@ async function main() {
       return;
     }
     const exited = new Promise((resolve) => child.once('exit', resolve));
-    child.kill('SIGTERM');
-    await exited;
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
+    await Promise.race([exited, sleep(2000)]);
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      await Promise.race([exited, sleep(500)]);
+    }
   };
 
   try {
@@ -603,6 +631,8 @@ async function main() {
     assert(dashboardStateJson.current && dashboardStateJson.current.permissionLabel, 'dashboard state missing current worker summary');
     assert(dashboardStateJson.workspaceInfo && dashboardStateJson.workspaceInfo.worker, 'dashboard state missing workspaceInfo');
     assert(dashboardStateJson.workspaceInfo.workspace && dashboardStateJson.workspaceInfo.workspace.root === workspaceDir, 'dashboard state workspaceInfo root mismatch');
+    assert(dashboardStateJson.suggestedWorkerName, 'dashboard state missing suggestedWorkerName');
+    assert(typeof dashboardStateJson.suggestedPort === 'number', 'dashboard state missing suggestedPort');
     assert(!JSON.stringify(dashboardStateJson).includes(token), 'dashboard state leaked MCP_TOKEN');
     const dashboardJobs = await fetch(`${baseUrl}/api/jobs`);
     assert(dashboardJobs.status === 200, `dashboard jobs failed with ${dashboardJobs.status}`);
@@ -644,12 +674,19 @@ async function main() {
         permission: 'yolo',
         port: createdWorkerPort,
         tunnelMode: 'quick',
+        allowOutsideWorkspace: false,
       }),
     });
     assert(createdWorker.status === 200, `worker create failed with ${createdWorker.status}`);
     const createdWorkerJson = await createdWorker.json();
     assert(createdWorkerJson.ok === true, 'worker create missing ok flag');
-    assert(createdWorkerJson.envFile && String(createdWorkerJson.envFile).endsWith(`${createdWorkerName}.env`), 'worker create missing envFile');
+    assert(createdWorkerJson.envFile, 'worker create missing envFile');
+    assert(createdWorkerJson.port === createdWorkerPort, 'worker create port mismatch');
+    assert(createdWorkerJson.allowOutsideWorkspace === false, 'worker create boundary mismatch');
+    createdWorkerName = String(createdWorkerJson.worker || createdWorkerName).trim();
+    assert(createdWorkerName, 'worker create missing resolved worker name');
+    assert(createdWorkerJson.envFile && String(createdWorkerJson.envFile).endsWith(`${createdWorkerName}.env`), 'worker create resolved envFile mismatch');
+    createdWorkerStarted = true;
 
     createdWorkerEnvFile = path.join(root, '.mcp-workbench', 'workers', `${createdWorkerName}.env`);
     assert(await fs.access(createdWorkerEnvFile).then(() => true).catch(() => false), 'created worker env file missing');
@@ -666,17 +703,6 @@ async function main() {
     const authHeaderJson = await authHeaderResponse.json();
     assert(authHeaderJson.authMode === 'bearer', 'auth-header mode mismatch');
     assert(String(authHeaderJson.authHeader || '').startsWith('Authorization: Bearer '), 'auth-header did not return bearer token');
-
-    const startServer = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/start`, {
-      method: 'POST',
-      headers: actionHeaders,
-      body: '{}',
-    });
-    const startServerText = await startServer.text();
-    assert(startServer.status === 200, `worker server start failed with ${startServer.status}: ${startServerText}`);
-    const startServerJson = JSON.parse(startServerText || '{}');
-    assert(startServerJson.ok === true, 'worker server start missing ok flag');
-    createdWorkerStarted = true;
 
     for (let i = 0; i < 40; i += 1) {
       try {
@@ -701,6 +727,16 @@ async function main() {
       if (i === 19) throw new Error(`created worker runtime state missing: ${createdWorkerRuntimeStatePath}`);
     }
     const createdWorkerRuntimeState = JSON.parse(await fs.readFile(createdWorkerRuntimeStatePath, 'utf8'));
+    assert(createdWorkerRuntimeState.server && Number(createdWorkerRuntimeState.server.pid || 0) > 0, 'created worker server pid missing');
+    assert(createdWorkerRuntimeState.tunnel && Number(createdWorkerRuntimeState.tunnel.pid || 0) > 0, 'created worker tunnel pid missing');
+    const stopTunnel = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/tunnel/stop`, {
+      method: 'POST',
+      headers: actionHeaders,
+      body: '{}',
+    });
+    assert(stopTunnel.status === 200, `worker tunnel stop failed with ${stopTunnel.status}`);
+    const stopTunnelJson = await stopTunnel.json();
+    assert(stopTunnelJson.ok === true, 'worker tunnel stop missing ok flag');
     const fakeTunnelUrl = 'https://smoke-tunnel-example.trycloudflare.com';
     await fs.writeFile(createdWorkerTunnelLogPath, `2026-01-01T00:00:00Z INF Your quick Tunnel is ready at ${fakeTunnelUrl}\n`, 'utf8');
     await fs.writeFile(createdWorkerRuntimeStatePath, JSON.stringify({
@@ -709,6 +745,8 @@ async function main() {
         ...(createdWorkerRuntimeState.tunnel || {}),
         pid: createdWorkerRuntimeState.tunnel?.pid || 424242,
         status: createdWorkerRuntimeState.tunnel?.status || 'running',
+        publicUrl: fakeTunnelUrl,
+        publicConnectorUrl: `${fakeTunnelUrl}/mcp`,
       },
     }, null, 2), 'utf8');
 
@@ -718,16 +756,6 @@ async function main() {
     assert(dashboardWithTunnelJson.connection && dashboardWithTunnelJson.connection.publicConnectorUrl === `${fakeTunnelUrl}/mcp`, 'dashboard did not surface public connector URL');
     assert(dashboardWithTunnelJson.tunnel && dashboardWithTunnelJson.tunnel.publicUrl === fakeTunnelUrl, 'dashboard did not surface tunnel public URL');
     assert(String(dashboardWithTunnelJson.tunnel?.logTail || '').includes(fakeTunnelUrl), 'dashboard did not surface tunnel log tail');
-
-    const stopServer = await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/stop`, {
-      method: 'POST',
-      headers: actionHeaders,
-      body: '{}',
-    });
-    assert(stopServer.status === 200, `worker server stop failed with ${stopServer.status}`);
-    const stopServerJson = await stopServer.json();
-    assert(stopServerJson.ok === true, 'worker server stop missing ok flag');
-    createdWorkerStarted = false;
 
     const presetList = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'workflow_presets',
@@ -868,26 +896,58 @@ async function main() {
     assert(Array.isArray(cargoDiffJson.removedPatterns), 'signal_diff missing removedPatterns');
     assert(typeof cargoDiffJson.reductionPct === 'number', 'signal_diff missing reductionPct');
 
-    const workflowRejected = await rpc(baseUrl, sessionId, 'tools/call', {
+    const workflowInline = await rpc(baseUrl, sessionId, 'tools/call', {
       name: 'workflow',
       arguments: {
         steps: [
           {
+            tool: 'read',
+            arguments: {
+              path: 'hello.txt',
+            },
+            description: 'Read workspace context',
+          },
+          {
             tool: 'bash',
             arguments: {
-              command: 'printf should-not-run',
+              command: 'printf inline-workflow-ok',
               cwd: '.',
-              description: 'blocked bash step',
+              description: 'Inline bash step',
             },
           },
         ],
       },
-    }, { id: 'workflow-reject' });
-    assert(workflowRejected.status === 200, `workflow rejection call failed with ${workflowRejected.status}`);
-    const workflowRejectedJson = JSON.parse(workflowRejected.body?.result?.content?.[0]?.text || '{}');
-    assert(workflowRejectedJson.kind === 'workflow_preflight_error', `workflow rejection kind mismatch: ${workflowRejectedJson.kind}`);
-    assert(workflowRejectedJson.status === 'rejected', `workflow rejection status mismatch: ${workflowRejectedJson.status}`);
-    assert(Array.isArray(workflowRejectedJson.errors) && workflowRejectedJson.errors.some((entry) => String(entry).includes('bash')), 'workflow rejection errors missing bash');
+    }, { id: 'workflow-inline' });
+    assert(workflowInline.status === 200, `workflow inline call failed with ${workflowInline.status}`);
+    const workflowInlineJson = JSON.parse(workflowInline.body?.result?.content?.[0]?.text || '{}');
+    const inlineJobId = workflowInlineJson.jobId;
+    assert(inlineJobId, 'workflow inline job id missing');
+
+    let workflowInlineStatus = null;
+    for (let i = 0; i < 40; i += 1) {
+      const statusRes = await rpc(baseUrl, sessionId, 'tools/call', {
+        name: 'workflow_status',
+        arguments: { jobId: inlineJobId },
+      }, { id: `workflow-inline-status-${i}` });
+      assert(statusRes.status === 200, `workflow_status for inline job failed with ${statusRes.status}`);
+      workflowInlineStatus = JSON.parse(statusRes.body?.result?.content?.[0]?.text || '{}');
+      if (workflowInlineStatus.status && workflowInlineStatus.status !== 'running' && workflowInlineStatus.status !== 'queued') {
+        break;
+      }
+      await sleep(250);
+    }
+    assert(workflowInlineStatus && workflowInlineStatus.status === 'completed', `inline workflow did not complete: ${JSON.stringify(workflowInlineStatus)}`);
+
+    const workflowInlineResult = await rpc(baseUrl, sessionId, 'tools/call', {
+      name: 'workflow_result',
+      arguments: { jobId: inlineJobId },
+    }, { id: 'workflow-inline-result' });
+    assert(workflowInlineResult.status === 200, `workflow_result for inline job failed with ${workflowInlineResult.status}`);
+    const workflowInlineResultJson = JSON.parse(workflowInlineResult.body?.result?.content?.[0]?.text || '{}');
+    const inlineTrace = workflowInlineResultJson.result?.trace || [];
+    assert(inlineTrace.length === 2, `inline workflow trace length mismatch: ${inlineTrace.length}`);
+    assert(String(inlineTrace[0]?.result || '').includes('hello from smoke test'), 'inline workflow read step mismatch');
+    assert(String(inlineTrace[1]?.result || '').includes('inline-workflow-ok'), 'inline workflow bash step mismatch');
 
     const oversizedBody = await fetch(baseUrl, {
       method: 'POST',
@@ -916,15 +976,30 @@ async function main() {
   } finally {
     if (createdWorkerStarted && dashboardActionToken) {
       try {
-        await fetch(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/stop`, {
-          method: 'POST',
-          headers: {
-            accept: 'application/json',
-            'content-type': 'application/json',
-            'x-mcp-dashboard-token': dashboardActionToken,
-          },
-          body: '{}',
-        });
+        const stopHeaders = {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'x-mcp-dashboard-token': dashboardActionToken,
+        };
+        const stopWithTimeout = async (url) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(new Error('cleanup timeout')), 2000);
+          timer.unref?.();
+          try {
+            await fetch(url, {
+              method: 'POST',
+              headers: stopHeaders,
+              body: '{}',
+              signal: controller.signal,
+            });
+          } catch {
+            // ignore cleanup failures
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        await stopWithTimeout(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/tunnel/stop`);
+        await stopWithTimeout(`${baseUrl}/api/workers/${encodeURIComponent(createdWorkerName)}/server/stop`);
       } catch {
         // ignore cleanup failure
       }

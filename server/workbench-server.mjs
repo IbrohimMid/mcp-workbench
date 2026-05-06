@@ -27,6 +27,30 @@ const enableBash = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_BASH || '');
 const enableWebfetch = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_WEBFETCH || '');
 const enableWorkflow = /^(1|true|yes|on)$/i.test(process.env.MCP_ENABLE_WORKFLOW || '1');
 const sanitizeBashEnv = /^(1|true|yes|on)$/i.test(process.env.MCP_SANITIZE_BASH_ENV || '1');
+const runtimeWorkflowPermissions = {
+  filesystem: {
+    read: true,
+    write: enableWriteTools,
+  },
+  shell: {
+    enabled: enableBash,
+  },
+  network: {
+    enabled: enableWebfetch,
+  },
+};
+const presetWorkflowPermissions = {
+  filesystem: {
+    read: true,
+    write: false,
+  },
+  shell: {
+    enabled: false,
+  },
+  network: {
+    enabled: false,
+  },
+};
 const maxBodyBytes = Math.max(1024, Number(process.env.MCP_MAX_BODY_BYTES || 1048576));
 const responseMode = String(process.env.MCP_RESPONSE_MODE || 'auto').trim().toLowerCase();
 const allowedOrigins = String(process.env.MCP_ALLOWED_ORIGINS || '*')
@@ -1112,22 +1136,26 @@ function parsePresetYaml(text) {
   return parseBlock(0);
 }
 
-function normalizeWorkflowPermissions(rawPermissions) {
+function normalizeWorkflowPermissions(rawPermissions, fallbackPermissions = presetWorkflowPermissions) {
   const permissions = isPlainObject(rawPermissions) ? rawPermissions : {};
+  const fallback = isPlainObject(fallbackPermissions) ? fallbackPermissions : {};
   const filesystem = isPlainObject(permissions.filesystem) ? permissions.filesystem : {};
+  const filesystemFallback = isPlainObject(fallback.filesystem) ? fallback.filesystem : {};
   const shell = isPlainObject(permissions.shell) ? permissions.shell : {};
+  const shellFallback = isPlainObject(fallback.shell) ? fallback.shell : {};
   const network = isPlainObject(permissions.network) ? permissions.network : {};
+  const networkFallback = isPlainObject(fallback.network) ? fallback.network : {};
 
   return {
     filesystem: {
-      read: filesystem.read !== false,
-      write: filesystem.write === true,
+      read: filesystem.read !== undefined ? filesystem.read !== false : filesystemFallback.read !== false,
+      write: filesystem.write !== undefined ? filesystem.write === true : filesystemFallback.write === true,
     },
     shell: {
-      enabled: shell.enabled === true,
+      enabled: shell.enabled !== undefined ? shell.enabled === true : shellFallback.enabled === true,
     },
     network: {
-      enabled: network.enabled === true,
+      enabled: network.enabled !== undefined ? network.enabled === true : networkFallback.enabled === true,
     },
   };
 }
@@ -1237,7 +1265,7 @@ async function loadWorkflowPreset(name) {
     throw new Error(`workflow preset must be an object: ${path.basename(filePath)}`);
   }
   const steps = Array.isArray(parsed.steps) ? parsed.steps.map(normalizeWorkflowStep) : [];
-  const permissions = normalizeWorkflowPermissions(parsed.permissions);
+  const permissions = normalizeWorkflowPermissions(parsed.permissions, presetWorkflowPermissions);
   return {
     name: String(parsed.name || path.basename(filePath, ext)),
     description: parsed.description ? String(parsed.description) : '',
@@ -1290,7 +1318,7 @@ async function resolveWorkflowPlan(args) {
   const explicitName = String(args.name || '').trim();
   let preset = null;
   let steps = inlineSteps;
-  let permissions = normalizeWorkflowPermissions(null);
+  let permissions = normalizeWorkflowPermissions(null, runtimeWorkflowPermissions);
   let name = explicitName;
   let description = '';
 
@@ -3228,6 +3256,37 @@ async function discoverWorkers() {
   return workers;
 }
 
+function collectUsedWorkerPorts(workers = []) {
+  const ports = new Set();
+  for (const worker of workers) {
+    const value = Number(worker?.port || 0);
+    if (Number.isFinite(value) && value > 0) {
+      ports.add(value);
+    }
+  }
+  return ports;
+}
+
+function suggestWorkerName(baseName, existingNames = new Set()) {
+  const seed = String(baseName || 'worker').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'worker';
+  if (!existingNames.has(seed)) return seed;
+  for (let i = 2; i < 1000; i += 1) {
+    const candidate = `${seed}-${i}`;
+    if (!existingNames.has(candidate)) return candidate;
+  }
+  return `${seed}-${Date.now()}`;
+}
+
+function pickAvailableWorkerPort(preferredPort, usedPorts = new Set()) {
+  const seed = Number(preferredPort);
+  const start = Number.isFinite(seed) && seed > 0 ? seed : 3333;
+  let port = start;
+  while (usedPorts.has(port)) {
+    port += 1;
+  }
+  return port;
+}
+
 function pickWorker(workers, workerName) {
   if (workerName) {
     const found = workers.find((worker) => worker.name === workerName);
@@ -3397,6 +3456,8 @@ async function buildDashboardPayload(urlObj, options = {}) {
   const workerName = String(urlObj.searchParams.get('worker') || '').trim();
   const jobId = String(urlObj.searchParams.get('job') || '').trim();
   const workers = await discoverWorkers();
+  const workerNames = new Set(workers.map((worker) => worker.name));
+  const usedPorts = collectUsedWorkerPorts(workers);
   const current = pickWorker(workers, workerName);
   const currentSummary = current.summary || current;
   const currentRuntime = await snapshotWorkerRuntime(currentSummary.name);
@@ -3410,6 +3471,8 @@ async function buildDashboardPayload(urlObj, options = {}) {
   const dashboardUrl = currentSummary.dashboardUrl || `http://${currentHost}:${currentPort}/dashboard`;
   const tunnelUrl = currentSummary.tunnelUrl ? `${currentSummary.tunnelUrl.replace(/\/$/, '')}/mcp` : '';
   const workspaceInfo = buildWorkspaceInfoFromSummary(currentSummary, currentRuntime, { includeSecrets: exposeSecrets });
+  const suggestedWorkerName = suggestWorkerName(currentSummary.name || currentSummary.client || 'worker', workerNames);
+  const suggestedPort = pickAvailableWorkerPort(currentPort + 1, usedPorts);
   const { env: _env, ...currentWithoutEnv } = currentSummary;
   const publicConnectorUrl = currentRuntime?.tunnel?.publicConnectorUrl
     || (currentRuntime?.tunnel?.publicUrl ? `${String(currentRuntime.tunnel.publicUrl).replace(/\/$/, '')}/mcp` : '')
@@ -3418,6 +3481,8 @@ async function buildDashboardPayload(urlObj, options = {}) {
     ok: true,
     server: workspaceInfo.server,
     workspaceInfo,
+    suggestedWorkerName,
+    suggestedPort,
     current: {
       ...currentWithoutEnv,
       runtime: currentRuntime,
@@ -3466,7 +3531,7 @@ async function buildDashboardPayload(urlObj, options = {}) {
         host: workerSummary.host,
         dashboardUrl: workerSummary.dashboardUrl,
         mcpUrl: workerSummary.mcpUrl,
-        publicConnectorUrl: worker.runtime?.tunnel?.publicConnectorUrl || '',
+        publicConnectorUrl: runtime?.tunnel?.publicConnectorUrl || '',
         tunnelMode: workerSummary.tunnelMode,
         runtime,
         isSelected: workerSummary.name === currentSummary.name,
@@ -3674,16 +3739,24 @@ async function restartWorkerRuntimeComponent(name, component) {
 }
 
 async function createWorkerFromDashboard(payload = {}) {
-  const name = safeWorkerName(payload.name);
-  const client = String(payload.client || name).trim().toLowerCase();
+  const requestedName = safeWorkerName(payload.name);
+  const client = String(payload.client || requestedName).trim().toLowerCase();
   const workspace = String(payload.workspace || '').trim();
   if (!workspace) throw new Error('workspace is required');
   const permission = String(payload.permission || 'yolo').trim().toLowerCase();
-  const port = Number(payload.port || 0);
-  if (!Number.isFinite(port) || port <= 0) throw new Error('port is required');
+  const allowOutsideWorkspace = /^(1|true|yes|on)$/i.test(String((payload.allowOutsideWorkspace ?? payload.allow_outside_workspace) || '').trim());
+  const requestedPort = Number(payload.port || 0);
+  if (!Number.isFinite(requestedPort) || requestedPort <= 0) throw new Error('port is required');
   const tunnelMode = String(payload.tunnelMode || payload.tunnel_mode || 'quick').trim().toLowerCase();
   const workflowMode = String(payload.workflowMode || payload.workflow_mode || 'sync').trim();
   const overwrite = payload.overwrite === true;
+  const workers = await discoverWorkers();
+  const usedPorts = collectUsedWorkerPorts(workers);
+  const workerNames = new Set(workers.map((worker) => worker.name));
+  const name = !overwrite && workerNames.has(requestedName)
+    ? suggestWorkerName(requestedName, workerNames)
+    : requestedName;
+  const port = pickAvailableWorkerPort(requestedPort, usedPorts);
 
   const args = [
     path.join(repoRoot, 'scripts', 'generate-worker.mjs'),
@@ -3696,6 +3769,9 @@ async function createWorkerFromDashboard(payload = {}) {
     '--tunnel-mode', tunnelMode,
     '--workflow-mode', workflowMode,
   ];
+  if (allowOutsideWorkspace) {
+    args.push('--allow-outside-workspace');
+  }
 
   if (payload.serverCmd) {
     args.push('--server-cmd', String(payload.serverCmd));
@@ -3720,13 +3796,20 @@ async function createWorkerFromDashboard(payload = {}) {
     throw new Error(result.stderr || result.stdout || 'worker generation failed');
   }
 
+  await startWorkerRuntimeComponent(name, 'server');
+  await startWorkerRuntimeComponent(name, 'tunnel');
+
   return {
     ok: true,
     worker: name,
+    requestedWorker: requestedName,
+    renamedFrom: name !== requestedName ? requestedName : '',
     client,
     permission,
+    requestedPort,
     port,
     workspace,
+    allowOutsideWorkspace,
     stdout: String(result.stdout || '').trim(),
     stderr: String(result.stderr || '').trim(),
     envFile: path.join(repoRoot, '.mcp-workbench', 'workers', `${name}.env`),
@@ -4111,6 +4194,49 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: 'not found' });
 });
 
+const activeSockets = new Set();
+let shutdownInProgress = false;
+
+server.on('connection', (socket) => {
+  activeSockets.add(socket);
+  socket.on('close', () => {
+    activeSockets.delete(socket);
+  });
+});
+
+function shutdownServer(signalName) {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+
+  for (const socket of activeSockets) {
+    try {
+      socket.destroy();
+    } catch {
+      // ignore
+    }
+  }
+
+  const forceExitTimer = setTimeout(() => {
+    try {
+      for (const socket of activeSockets) {
+        try {
+          socket.destroy();
+        } catch {
+          // ignore
+        }
+      }
+    } finally {
+      process.exit(0);
+    }
+  }, 1500);
+  forceExitTimer.unref?.();
+
+  server.close(() => {
+    clearTimeout(forceExitTimer);
+    process.exit(0);
+  });
+}
+
 server.on('error', (err) => {
   console.error('[mcp-workbench] server error:', err);
   process.exit(1);
@@ -4122,10 +4248,10 @@ server.listen(port, host, () => {
   console.log(`[mcp-workbench] jobs: ${realJobsRoot}`);
 });
 
-process.on('SIGINT', async () => {
-  server.close(() => process.exit(0));
+process.on('SIGINT', () => {
+  shutdownServer('SIGINT');
 });
 
-process.on('SIGTERM', async () => {
-  server.close(() => process.exit(0));
+process.on('SIGTERM', () => {
+  shutdownServer('SIGTERM');
 });

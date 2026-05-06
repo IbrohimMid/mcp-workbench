@@ -315,6 +315,19 @@ function normalizePort(value) {
   return Number.isFinite(port) && port > 0 ? port : null;
 }
 
+function normalizeBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === '') {
+    return !!fallback;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  const text = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(text)) return true;
+  if (['0', 'false', 'no', 'off'].includes(text)) return false;
+  return !!fallback;
+}
+
 function normalizeWorkerSpec(raw, defaults, index, root) {
   const entry = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const name = normalizeWorkerName(entry.name, defaults.name);
@@ -337,6 +350,13 @@ function normalizeWorkerSpec(raw, defaults, index, root) {
 
   const permission = String(entry.permission ?? defaults.permission ?? 'yolo').trim().toLowerCase();
   const preset = permissionPreset(permission);
+  const allowOutsideWorkspace = normalizeBoolean(
+    entry.allowOutsideWorkspace
+    ?? entry.allow_outside_workspace
+    ?? defaults.allowOutsideWorkspace
+    ?? defaults.allow_outside_workspace
+    ?? false,
+  );
   const portBase = normalizePort(defaults.portBase ?? defaults.port_base ?? defaults.portbase);
   const port = normalizePort(entry.port) ?? (portBase !== null ? portBase + index : null);
   if (!port) {
@@ -358,6 +378,7 @@ function normalizeWorkerSpec(raw, defaults, index, root) {
     client,
     workspace,
     permission,
+    allowOutsideWorkspace,
     preset,
     port,
     tunnelMode,
@@ -391,6 +412,7 @@ async function loadWorkerProfile(profilePath) {
       ...defaults,
       workspace: parsed.workspace ?? defaults.workspace,
       permission: parsed.permission ?? defaults.permission ?? 'yolo',
+      allowOutsideWorkspace: parsed.allowOutsideWorkspace ?? defaults.allowOutsideWorkspace ?? false,
       portBase: parsed.portBase ?? parsed.port_base ?? defaults.portBase ?? defaults.port_base ?? null,
       tunnelMode: parsed.tunnelMode ?? parsed.tunnel_mode ?? defaults.tunnelMode ?? defaults.tunnel_mode ?? 'quick',
       workflowMode: parsed.workflowMode ?? parsed.workflow_mode ?? defaults.workflowMode ?? defaults.workflow_mode ?? 'sync',
@@ -429,7 +451,7 @@ async function writeWorkerEnv(root, spec, options = {}) {
     MCP_TOKEN: spec.token,
     MCP_ALLOW_NO_AUTH: '0',
     MCP_ALLOW_QUERY_TOKEN: '0',
-    MCP_ALLOW_OUTSIDE_WORKSPACE: '0',
+    MCP_ALLOW_OUTSIDE_WORKSPACE: spec.allowOutsideWorkspace ? '1' : '0',
     MCP_SERVER_CMD: spec.serverCmd,
     MCP_WORKFLOW_MODE: spec.workflowMode,
     MCP_WORKFLOW_JOB_DIR: jobDir,
@@ -530,6 +552,7 @@ async function main() {
       '  --permission <name>   readonly, standard, or yolo',
       '  --port <n>            Local MCP port',
       '  --token <value>       Use a fixed token instead of generating one',
+      '  --allow-outside-workspace  Set MCP_ALLOW_OUTSIDE_WORKSPACE=1',
       '  --tunnel-mode <name>  quick or named',
       '  --dry-run             Print the generated env and stop',
       '  --overwrite           Replace an existing worker env file',
@@ -553,6 +576,7 @@ async function main() {
         `  permission: ${spec.permission}`,
         `  port: ${spec.port}`,
         `  workspace: ${spec.workspace}`,
+        `  boundary: ${spec.allowOutsideWorkspace ? 'outside workspace allowed' : 'workspace-bound'}`,
         `  auth: bearer token`,
         `  tunnel: ${spec.tunnelMode}`,
       ]),
@@ -572,6 +596,7 @@ async function main() {
   const port = Number(args.port || 0);
   const tunnelMode = String(args['tunnel-mode'] || args.tunnelMode || 'quick').trim().toLowerCase();
   const token = String(args.token || '').trim() || randomToken();
+  const allowOutsideWorkspace = normalizeBoolean(args['allow-outside-workspace'] ?? args.allowOutsideWorkspace ?? args.allow_outside_workspace, false);
 
   if (!name) die('--name is required');
   if (!client) die('--client is required');
@@ -612,7 +637,7 @@ async function main() {
     MCP_TOKEN: token,
     MCP_ALLOW_NO_AUTH: '0',
     MCP_ALLOW_QUERY_TOKEN: '0',
-    MCP_ALLOW_OUTSIDE_WORKSPACE: '0',
+    MCP_ALLOW_OUTSIDE_WORKSPACE: allowOutsideWorkspace ? '1' : '0',
     MCP_SERVER_CMD: serverCmd,
     MCP_WORKFLOW_MODE: String(args['workflow-mode'] || 'sync'),
     MCP_WORKFLOW_JOB_DIR: jobDir,
@@ -669,6 +694,7 @@ async function main() {
     `  permission: ${permission}`,
     `  port: ${port}`,
     `  workspace: ${workspace}`,
+    `  boundary: ${allowOutsideWorkspace ? 'outside workspace allowed' : 'workspace-bound'}`,
     `  auth: bearer token`,
     `  tunnel: ${tunnelMode}`,
     `  next: ./scripts/worker-up.sh ${name}`,
